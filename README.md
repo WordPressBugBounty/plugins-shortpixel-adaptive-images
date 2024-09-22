@@ -1,0 +1,1 @@
+# plugins-shortpixel-adaptive-images
