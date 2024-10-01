@@ -72,7 +72,8 @@ class VanillaJsLoader extends JsLoader {
                         debug: <?= SHORTPIXEL_AI_DEBUG ? 'true' : 'false' ?>,
                         doSelectors: "__SPAI_DO_SELECTORS__",
                         exclusions: "__SPAI_EXCLUSIONS__",
-                        sizeFromImageSuffix: <?php echo(defined('SPAI_FILENAME_RESOLUTION_UNSAFE') ? 'false' : 'true'); ?>
+                        sizeFromImageSuffix: <?php echo(defined('SPAI_FILENAME_RESOLUTION_UNSAFE') ? 'false' : 'true'); ?>,
+                        ajax_url: "<?= admin_url( 'admin-ajax.php' ) ?>",
                     };
                     b.appendChild(s);
                 }(window, document));

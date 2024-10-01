@@ -21,7 +21,9 @@
 
 		var xhr = new XMLHttpRequest(),
 			action,
-			url = typeof spai_settings === 'undefined' ? '/wp-admin/admin-ajax.php' : spai_settings.ajax_url;
+			url = typeof spai_settings === 'undefined'
+				? (typeof spaiData === 'undefined' ? '/wp-admin/admin-ajax.php' : spaiData.ajax_url)
+				: spai_settings.ajax_url;
 
 		if ( typeof w.jQuery !== 'function' ) {
 			action = 'shortpixel_deactivate_ai';

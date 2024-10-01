@@ -4,7 +4,7 @@ Tags: image optimization, convert, webp, lazy load, avif
 Requires at least: 4.7
 Tested up to: 6.6
 Requires PHP: 5.6.40
-Stable tag: 3.9.3
+Stable tag: 3.9.4
 License: GPLv2 or later
 License URI: http://www.gnu.org/licenses/gpl-2.0.html
 
@@ -234,6 +234,14 @@ This rule will only be applied by the New JS Engine (so you need to have the opt
 6. Advanced settings page
 
 == Changelog ==
+
+= 3.9.4 =
+Release date: October 1, 2024
+* Fix: No longer add the `loading=lazy` attribute for images marked as eager (for example, with `data-perfmatters-preload`);
+* Fix: Some deprecation warnings were displayed in various situations;
+* Fix: Make sure the plugin uses the correct ajax_url when changing the default WordPress paths;
+* Fix: Updated error message when trying to use the API key from SPIO and it is invalid;
+* Language: 2 new strings added, 0 updated, 0 fuzzed and 0 deprecated.
 
 = 3.9.3 =
 Release date: July 25, 2024

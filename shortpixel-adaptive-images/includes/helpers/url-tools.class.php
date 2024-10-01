@@ -51,7 +51,7 @@ class ShortPixelUrlTools {
 				$parsedHome = parse_url( home_url() );
 				//TODO allowed domains unhack
 				$cssDomains = ShortPixelAI::_()->settings->areas->css_domains;
-				$cssDomains = strlen($cssDomains) ? explode(',', $cssDomains) : [];
+				$cssDomains = strlen($cssDomains ?: '') ? explode(',', $cssDomains) : [];
 				ShortPixelAILogger::instance()->log( "CSS DOMAIN: {$parsed['host']} EXTRA DOMAINS: ", $cssDomains );
 
 				return isset( $parsedHome[ 'host' ] ) && ( $parsed[ 'host' ] == $parsedHome[ 'host' ] || in_array( $parsed[ 'host' ], $cssDomains ) );

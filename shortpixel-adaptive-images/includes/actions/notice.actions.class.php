@@ -33,7 +33,7 @@
 							'dismissible' => true,
 						],
 						'message' => [
-							'body' => [ __( 'Something went wrong...', 'shortpixel-adaptive-images' ) . __( 'Please contact the <a href="https://shortpixel.com/contact" target="_blank"><strong>ShortPixel Support</strong></a>.', 'shortpixel-adaptive-images' ) ],
+							'body' => [ __( 'Something went wrong... API key is invalid. ', 'shortpixel-adaptive-images' ) . __( 'Please check it on your account: <a href="https://shortpixel.com/login" target="_blank"><strong>Login</strong></a>.', 'shortpixel-adaptive-images' ) ],
 						],
 					] );
 			}

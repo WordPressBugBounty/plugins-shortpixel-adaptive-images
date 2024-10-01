@@ -619,7 +619,7 @@ class ShortPixelRegexParser {
         //WP is encoding some characters, like & ( to &#038; ), and oh, some URLs end in spaces...
         $url = trim(html_entity_decode($url));
 
-        //early check for the excluded selectors - only the basic cases when the selector is img.class
+        //early check for the excluded selectors - only the basic cases when the selector is img.class img#id or img[attr]
         if($this->ctrl->tagIs('excluded', $text)) {
             $this->logger->log("Excluding: " . $text);
             return $text;
@@ -792,7 +792,9 @@ class ShortPixelRegexParser {
         if(strlen(trim($matches[4])) == 0) return $text; //it's an empty srcset attribute: srcset=" " - this is used by SPAI too for woocommerce variations JS in some cases, that would break otherwise
         $pattern = $matches[2] . '=' . $matches[3] . $matches[4] . $matches[3];
         $replacement = ' ' . $matches[2] . '=' . $qm . $this->replace_srcset($matches[4]) . $qm;
-        if($this->ctrl->settings->behaviour->replace_method === 'src' && strpos($text, 'loading=') === false) {
+        if($this->ctrl->settings->behaviour->replace_method === 'src'
+            && strpos($text, 'loading=') === false
+            && !$this->isEager && !$this->ctrl->tagIs('eager', $text)) {
             $replacement .= ' loading="lazy"';
         }
         $pos = strpos($text, $pattern);

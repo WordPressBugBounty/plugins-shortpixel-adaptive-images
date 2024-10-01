@@ -1504,8 +1504,12 @@ class ShortPixelAI {
     }
 
     public function get_extension( $url ) {
-	    return pathinfo(parse_url($url, PHP_URL_PATH),  PATHINFO_EXTENSION);
-	}
+        $path = parse_url( $url, PHP_URL_PATH );
+        if ( !is_string( $path ) || empty( $path ) ) {
+            return null;
+        }
+        return pathinfo( $path, PATHINFO_EXTENSION );
+    }
 
     public static function is_ssl($url) {
         return strpos($url, 'https://') === 0;
