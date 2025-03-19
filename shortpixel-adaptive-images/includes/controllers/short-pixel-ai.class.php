@@ -1494,7 +1494,14 @@ class ShortPixelAI {
                 return $this->conflict;
             }
         }
-
+        if (function_exists('is_plugin_active') && is_plugin_active('sg-cachepress/sg-cachepress.php')) {
+            $speedoptimizer = get_option('siteground_optimizer_combine_javascript', false);
+            //var_dump($speedoptimizer);
+            if ($speedoptimizer === '1') {
+                $this->conflict = 'speedoptimizer';
+                return $this->conflict;
+            }
+        }
         $theme = wp_get_theme();
         if (strpos($theme->Name, 'Avada') !== false) {
             $avadaOptions = get_option('fusion_options', array());
