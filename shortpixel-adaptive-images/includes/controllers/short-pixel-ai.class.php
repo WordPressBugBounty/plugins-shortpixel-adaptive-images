@@ -121,7 +121,8 @@ class ShortPixelAI {
 	}
 
     private function __construct() {
-        add_action( 'after_setup_theme', [ $this, 'load_textdomain' ] );
+        add_action( 'init', [ $this, 'load_textdomain' ] );
+
 
         $this->logger = ShortPixelAILogger::instance();
         $this->options = Options::_();
