@@ -4,7 +4,7 @@ Tags: image optimization, convert, webp, lazy load, avif
 Requires at least: 4.7
 Tested up to: 6.8
 Requires PHP: 5.6.40
-Stable tag: 3.10.2
+Stable tag: 3.10.1
 License: GPLv2 or later
 License URI: http://www.gnu.org/licenses/gpl-2.0.html
 
@@ -248,19 +248,6 @@ This rule will only be applied by the New JS Engine (so you need to have the opt
 6. Advanced settings page
 
 == Changelog ==
-
-= 3.10.2 =
-
-🦅 The Early Bird Fix
-
-Release Date: April 17, 2025
-
-🛠️ Fixes & Improvements
-
-* Textdomain Warning Resolved: Fixed a deprecation warning related to loading the textdomain too early, ensuring cleaner and more reliable plugin initialization.
-
-Update now for a smoother start every time WordPress loads! 🚀
-
 = 3.10.1 =
 
 🔒 The Security & Compatibility Update
