@@ -2,7 +2,7 @@
 Contributors: ShortPixel
 Tags: image optimization, convert, webp, lazy load, avif
 Requires at least: 4.7
-Tested up to: 6.8
+Tested up to: 6.9
 Requires PHP: 5.6.40
 Stable tag: 3.11.1
 License: GPLv2 or later
