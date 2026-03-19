@@ -85,6 +85,7 @@ abstract class JsLoader {
                         'includes' => WPINC . '/',
                     ],
                 ] );
+                \ShortPixelUrlTools::applyNonce('spai-front-worker');
                 wp_enqueue_script( 'spai-front-worker' );
             }
         }

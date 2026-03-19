@@ -1041,6 +1041,7 @@
 					'localStorage' => $this->ctrl->options->settings_behaviour_localStorage,
 				] );
 
+                \ShortPixelUrlTools::applyNonce('spai-lqip');
 				wp_enqueue_script( 'spai-lqip' );
 			}
 		}

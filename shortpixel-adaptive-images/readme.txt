@@ -4,7 +4,7 @@ Tags: image optimization, convert, webp, lazy load, avif
 Requires at least: 4.7
 Tested up to: 6.9
 Requires PHP: 5.6.40
-Stable tag: 3.11.1
+Stable tag: 3.11.2
 License: GPLv2 or later
 License URI: http://www.gnu.org/licenses/gpl-2.0.html
 
@@ -248,6 +248,23 @@ This rule will only be applied by the New JS Engine (so you need to have the opt
 6. Advanced settings page
 
 == Changelog ==
+
+= 3.11.2 =
+
+🛡️ The Compatibility & Security Update
+
+Release Date: March 19, 2026
+
+🛠️ Fixes
+
+* open_basedir Warning Fix: Resolved cases where open_basedir restrictions triggered PHP warnings, including when using the "Replace in CSS" option.
+
+✨ Tweaks & Improvements
+
+* Chatbot Expansion: The ShortPixel AI chatbot is now available in the Settings and onboarding pages for quicker assistance.
+* CSP Nonce Integration: Added support for Content Security Policy (CSP) nonces to improve compatibility with stricter security setups.
+
+Update now for improved compatibility, smoother setup, and enhanced security support! 🚀
 
 = 3.11.1 =
 

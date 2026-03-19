@@ -103,6 +103,7 @@ class VanillaJsLoader extends JsLoader {
                 'excluded_paths'        => array_map( 'base64_encode', $this->ctrl->splitSelectors( $this->settings->exclusions->excluded_paths, PHP_EOL ) ),
                 'eager_paths'           => array_map( 'base64_encode', $this->ctrl->splitSelectors( $this->settings->exclusions->eager_paths, PHP_EOL ) ),
             ]);
+            \ShortPixelUrlTools::applyNonce('spai-snip-action');
             wp_enqueue_script( 'spai-snip-action'  );
             wp_add_inline_script('spai-snip-action',
             "function spaiSniperClick() {

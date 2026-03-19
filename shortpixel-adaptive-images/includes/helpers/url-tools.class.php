@@ -223,14 +223,14 @@ class ShortPixelUrlTools {
             $path = preg_replace($baseUrlPattern, $updir['basedir'], $image_url);
             SHORTPIXEL_AI_DEBUG && ShortPixelAILogger::instance()->log("TAKE1: $path");
         }
-        if(!file_exists($path)) { //search in the wp-content directory too
+        if(!self::spai_safe_file_exists($path)) { //search in the wp-content directory too
             $baseUrlPattern = "/" . str_replace("/", "\/", preg_replace("/^http[s]{0,1}:\/\//", "^http[s]{0,1}://", dirname($updir['baseurl']))) . "/";
             SHORTPIXEL_AI_DEBUG && ShortPixelAILogger::instance()->log("BASE URL PATTERN2: $baseUrlPattern");
             if(preg_match($baseUrlPattern, $image_url)) {
                 $path = preg_replace($baseUrlPattern, dirname($updir['basedir']), $image_url);
                 ShortPixelAILogger::instance()->log("TAKE2: $path");
             }
-            if(!file_exists($path)) {
+            if(!self::spai_safe_file_exists($path)) {
                 //that's the root folder, it will match the ABSPATH
                 $absPath = untrailingslashit(function_exists('get_home_path') ? get_home_path() : ABSPATH);
                 $baseUrlPattern = "/" . str_replace("/", "\/", preg_replace("/^http[s]{0,1}:\/\//", "^http[s]{0,1}://", dirname(dirname($updir['baseurl'])))) . "/";
@@ -239,17 +239,17 @@ class ShortPixelUrlTools {
                     SHORTPIXEL_AI_DEBUG && ShortPixelAILogger::instance()->log("TAKE3: $path");
                 }
                 //cases for multisite when the URL contains an extra element but the local path doesn't (eg food here: path: https://stagegie.wpengine.com/food/wp-content/uploads/sites/5/2020/01/Healthy-Chicken-Sheet-Pan-Fajitas-Get-Inspired-Everyday-5.jpg)
-                if(!file_exists($path)) {
+                if(!self::spai_safe_file_exists($path)) {
                     $baseDir = explode(DIRECTORY_SEPARATOR, $updir['basedir']);
                     $contentUploads = implode('/', array_slice($baseDir, -2, 2));
                     $contentSubdir = explode($contentUploads, $image_url);
                     if(isset($contentSubdir[1])) {
                         $path = $updir['basedir'] . $contentSubdir[1];
                         SHORTPIXEL_AI_DEBUG && ShortPixelAILogger::instance()->log("TAKE3BIS: $path");
-                        if(!file_exists($path) && preg_match('/https?:\/\//', $image_url) === false) {
+                        if(!self::spai_safe_file_exists($path) && preg_match('/https?:\/\//', $image_url) === false) {
                             $path = $absPath . ($image_url[0] == '/' ? '' : '/') . $image_url;
                             SHORTPIXEL_AI_DEBUG && ShortPixelAILogger::instance()->log("TAKE4: $path");
-                            if(!file_exists($path)) {
+                            if(!self::spai_safe_file_exists($path)) {
                                 //for cases when the WP directory is a subdir of the root
                                 $path = dirname($absPath) . ($image_url[0] == '/' ? '' : '/') . $image_url;
                                 SHORTPIXEL_AI_DEBUG && ShortPixelAILogger::instance()->log("TAKE5: $path");
@@ -260,21 +260,24 @@ class ShortPixelUrlTools {
             }
         }
 
-        SHORTPIXEL_AI_DEBUG && ShortPixelAILogger::instance()->log("URL TO PATH TO SIZES, checking: " . $path . ' EXISTS? ' . (file_exists($path) ? 'YEE, sizes: ' . json_encode(getimagesize($path)) : 'Nope. UPLOAD url:' . $updir['baseurl'] . ' BaseUrlPattern:' . $baseUrlPattern));
+        SHORTPIXEL_AI_DEBUG && ShortPixelAILogger::instance()->log("URL TO PATH TO SIZES, checking: " . $path . ' EXISTS? ' . (self::spai_safe_file_exists($path) ? 'YEE, sizes: ' . json_encode(getimagesize($path)) : 'Nope. UPLOAD url:' . $updir['baseurl'] . ' BaseUrlPattern:' . $baseUrlPattern));
 
-        if(@file_exists($path)) {
-            return self::getimagesizeOrSvg($path);
-        } elseif (@file_exists(urldecode($path))) {
-            return self::getimagesizeOrSvg(urldecode($path));
+        $abs = self::spai_normalize_fs_path($path);
+        if ($abs && self::spai_safe_file_exists($abs)) {
+            return self::getimagesizeOrSvg($abs);
+        }
+        $abs2 = $abs ? urldecode($abs) : self::spai_normalize_fs_path(urldecode($path));
+        if ($abs2 && self::spai_safe_file_exists($abs2)) {
+            return self::getimagesizeOrSvg($abs2);
         } else {
             //LOG open_basedir warnings: https://secure.helpscout.net/conversation/1229180365/34854/
             SHORTPIXEL_AI_DEBUG && !self::check_open_basedir($path) && ShortPixelAILogger::instance()->log('URL TO PATH TO SIZES: OPEN_BASEDIR (' . ini_get('open_basedir') . ') restriction in effect!');
 
             //try the default location for cases like this one which had wrong baseurl so the replace above did not work: https://secure.helpscout.net/conversation/943639884/20602?folderId=1117588
             $path = trailingslashit(ABSPATH) . 'wp-content/uploads/' . wp_basename(dirname(dirname($image_url))) . '/' . wp_basename(dirname($image_url)) . '/' . wp_basename($image_url);
-            if(@file_exists($path)) {
+            if(self::spai_safe_file_exists($path)) {
                 return self::getimagesizeOrSvg($path);
-            } elseif (@file_exists(urldecode($path))) {
+            } elseif (self::spai_safe_file_exists(urldecode($path))) {
                 return self::getimagesizeOrSvg(urldecode($path));
             }
         }
@@ -282,6 +285,12 @@ class ShortPixelUrlTools {
     }
 
     static function getimagesizeOrSvg($path) {
+        $abs = ShortPixelUrlTools::spai_normalize_fs_path($path);
+        if (!$abs || !ShortPixelUrlTools::check_open_basedir($abs)) {
+            return [1,1];
+        }
+        $path = $abs;
+
         if(strtolower(pathinfo($path, PATHINFO_EXTENSION)) === 'svg') {
             $svg = file_get_contents($path);
             preg_match('/viewBox=[\'"]\s*\d+\.?\d*\s+\d+\.?\d*\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s*[\'"]/s', $svg, $matches);
@@ -354,6 +363,31 @@ class ShortPixelUrlTools {
             }
         }
         return true;
+    }
+
+    /** converts any relative/absolute path to an absolute path under WP dir */
+    private static function spai_normalize_fs_path($candidate) {
+        if (!$candidate || preg_match('#^[a-z][a-z0-9+.\-]*://#i', $candidate)) return false; // e URL, nu cale
+        $root = wp_normalize_path( untrailingslashit( function_exists('get_home_path') ? get_home_path() : ABSPATH ) );
+        $p    = wp_normalize_path($candidate);
+
+        if ($p === $root || strpos($p, $root . '/') === 0) { // BUg :)) heere i checked if it's already under root, before i didn't and gave double root path
+            return $p;
+        }
+
+        // if starts with "/" ( /wp-content/...), prefix with ABSPATH
+        if (isset($p[0]) && $p[0] === '/') {
+            return $root . $p;
+        }
+        return $root . '/' . ltrim($p, '/');
+    }
+
+    /** check if the file exists on the disk, but only if the path is allowed by open_basedir */
+    private static function spai_safe_file_exists($candidate): bool {
+        $abs = self::spai_normalize_fs_path($candidate);
+        if (!$abs) return false;
+        if (!self::check_open_basedir($abs)) return false;
+        return @file_exists($abs);
     }
 
     static function get_from_meta_by_guid($image_url, $fuzzy = false) {
@@ -604,5 +638,13 @@ class ShortPixelUrlTools {
         }
 
         return urldecode(str_replace('data-u="', '', $matches[0]));
+    }
+
+    public static function applyNonce($name)
+    {
+        $nonce = apply_filters( 'spai_script_nonce', '' );
+        if($nonce) {
+            wp_scripts()->add_data( $name, 'nonce',  $nonce);
+        }
     }
 }

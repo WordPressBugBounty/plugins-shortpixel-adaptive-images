@@ -905,6 +905,7 @@ class ShortPixelAI {
                 ],
             ],
         ] );
+        \ShortPixelUrlTools::applyNonce('spai-sniper');
 
         wp_enqueue_script( 'spai-sniper');
     }
@@ -1116,6 +1117,8 @@ class ShortPixelAI {
             'spaiNonce',
             ['nonce' => \ShortPixel\AI\Page::_( ShortPixelAI::_() )->getNonce(),]
         );
+        \ShortPixelUrlTools::applyNonce('spai-admin-scripts');
+
 	}
 
 	/**

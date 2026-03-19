@@ -725,7 +725,8 @@
 			// Registering scripts
 			wp_register_script( 'spai-notice', $this->ctrl->plugin_url . $scripts[ 'notice' ][ 'file' ], [ 'jquery' ], $scripts[ 'notice' ][ 'version' ] );
 
-			// Enqueueing scripts
+            \ShortPixelUrlTools::applyNonce('spai-notice');
+            // Enqueueing scripts
 			wp_enqueue_script( 'spai-notice' );
 		}
 
