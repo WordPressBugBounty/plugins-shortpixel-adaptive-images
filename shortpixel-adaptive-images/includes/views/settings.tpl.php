@@ -1484,7 +1484,7 @@ $controller = $this->ctrl;
                                                 data-type="string"
                                                 data-exclusion-type="selectors"
                                                 data-setting="exclusion"
-                                            ><?= $eager_selectors; ?></textarea>
+                                            ><?= esc_textarea( (string) $eager_selectors ); ?></textarea>
                                         </div>
                                         <div><label for="noresize_selectors"><?= __( 'Don\'t resize:', 'shortpixel-adaptive-images' ); ?></label><br>
                                             <textarea
@@ -1494,7 +1494,7 @@ $controller = $this->ctrl;
                                                 data-type="string"
                                                 data-exclusion-type="selectors"
                                                 data-setting="exclusion"
-                                            ><?= $no_resize_selectors; ?></textarea>
+                                            ><?= esc_textarea( (string) $no_resize_selectors ); ?></textarea>
                                         </div>
                                         <div><label for="excluded_selectors"><?= __( 'Leave out completely:', 'shortpixel-adaptive-images' ); ?></label><br>
                                             <textarea
@@ -1504,7 +1504,7 @@ $controller = $this->ctrl;
                                                 data-type="string"
                                                 data-exclusion-type="selectors"
                                                 data-setting="exclusion"
-                                            ><?= $excluded_selectors; ?></textarea>
+                                            ><?= esc_textarea( (string) $excluded_selectors ); ?></textarea>
                                         </div>
                                         <p class="description">
                                             <?= __( 'Specify  a coma separated list of CSS selectors for images that should keep their original width on the page, or their original URLs.'

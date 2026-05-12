@@ -1128,11 +1128,37 @@ class ShortPixelAI {
 		return !!Options::_()->set( Options::_()->get( 'css_ver', [ 'flags', 'all' ], 0 ) + 1, 'css_ver', [ 'flags', 'all' ] );
 	}
 
+    /**
+     *  auth guard for settings-related AJAX actions
+     *
+     * @param array $result
+     * @return bool
+     */
+    private function can_manage_settings_ajax( &$result ) {
+        if ( ! is_admin() ) {
+            $result['message'] = __( 'Please log in as admin.', 'shortpixel-adaptive-images' );
+            return false;
+        }
+
+        if ( ! self::userCan( 'manage_options' ) ) {
+            $result['message'] = __( 'Insufficient permissions.', 'shortpixel-adaptive-images' );
+            return false;
+        }
+
+        $nonce_valid = check_ajax_referer( 'shortpixel-ai-settings', 'spainonce', false ) !== false;
+        if ( ! $nonce_valid ) {
+            $result['message'] = __( 'Invalid or expired nonce. Please retry the action.', 'shortpixel-adaptive-images' );
+            return false;
+        }
+
+        return true;
+    }
+
     //TODO refactor
     public function add_selector_to_list() {
         $result = array('status' => 'error', 'message' => __( 'An error occurred, please contact support.', 'shortpixel-adaptive-images' ));
-        $which = $_POST['which_list'];
-        if(is_admin()) {
+        $which = isset($_POST['which_list']) ? wp_unslash($_POST['which_list']) : '';
+        if($this->can_manage_settings_ajax($result)) {
             if(empty($_POST['selector']) || !is_string($_POST['selector'])) {
                 $result['message'] = __('Invalid selector has been provided.', 'shortpixel-adaptive-images' );
             }
@@ -1140,7 +1166,7 @@ class ShortPixelAI {
                 $result['message'] = __('Invalid list has been provided.', 'shortpixel-adaptive-images' );
             }
             else {
-                $selector =  preg_replace('/\s+/', ' ', trim($_POST['selector']));
+                $selector =  preg_replace('/\s+/', ' ', trim(wp_unslash($_POST['selector'])));
                 $wp_option_name = 'settings_exclusions_' . \ShortPixel\AI\Converter::snakeToCamelCase($which);
                 $selectors_now = $this->options->$wp_option_name;
                 $result['status'] = 'ok';
@@ -1202,18 +1228,14 @@ class ShortPixelAI {
                 $result['list'] = $this->splitSelectors($this->options->$wp_option_name, $delimiter);
             }
         }
-        else {
-            $result['message'] = __( 'Please log in as admin.', 'shortpixel-adaptive-images' );
-        }
-        echo json_encode($result);
-        wp_die();
+        wp_send_json($result);
     }
 
     //TODO refactor
     public function remove_selector_from_list() {
         $result = array('status' => 'error', 'message' => __( 'An error occurred, please contact support.', 'shortpixel-adaptive-images' ));
-        $which = $_POST['which_list'];
-        if(is_admin()) {
+        $which = isset($_POST['which_list']) ? wp_unslash($_POST['which_list']) : '';
+        if($this->can_manage_settings_ajax($result)) {
             if(empty($_POST['selector']) || !is_string($_POST['selector'])) {
                 $result['message'] = __('Invalid list has been provided.', 'shortpixel-adaptive-images' );
             }
@@ -1221,7 +1243,7 @@ class ShortPixelAI {
                 $result['message'] = __('Invalid list has been provided.', 'shortpixel-adaptive-images' );
             }
             else {
-                $selector = $_POST['selector'];
+                $selector = wp_unslash($_POST['selector']);
                 $delimiter = $which == 'excluded_paths' ? "\n" : ',';
                 $wp_option_name = 'settings_exclusions_' . \ShortPixel\AI\Converter::snakeToCamelCase($which);
                 $selectors_now = $this->options->$wp_option_name;
@@ -1260,12 +1282,7 @@ class ShortPixelAI {
                 $result['list'] = $this->splitSelectors($this->options->$wp_option_name, $delimiter);
             }
         }
-        else {
-            $result['message'] = __( 'Please log in as admin.', 'shortpixel-adaptive-images' );
-        }
-
-        echo json_encode($result);
-        wp_die();
+        wp_send_json($result);
     }
 
 	/**

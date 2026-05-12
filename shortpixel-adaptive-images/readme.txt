@@ -2,9 +2,9 @@
 Contributors: ShortPixel
 Tags: image optimization, convert, webp, lazy load, avif
 Requires at least: 4.7
-Tested up to: 6.9
+Tested up to: 7.0
 Requires PHP: 5.6.40
-Stable tag: 3.11.2
+Stable tag: 3.11.3
 License: GPLv2 or later
 License URI: http://www.gnu.org/licenses/gpl-2.0.html
 
@@ -248,6 +248,18 @@ This rule will only be applied by the New JS Engine (so you need to have the opt
 6. Advanced settings page
 
 == Changelog ==
+
+= 3.11.3 =
+
+🔒 The Secure Exclusions Update
+
+Release Date: May 12, 2026
+
+🛡️ Security Fix
+
+Security improvements: Improved auth/nonce validation on excluded selectors and properly escaped exclusions to prevent a potential stored Cross-Site Scripting (XSS) vulnerability, responsibly disclosed by the PatchStack team.
+
+Update now to benefit from the latest security and stability improvements. Special thanks to the PatchStack team for the responsible disclosure! 🙌
 
 = 3.11.2 =
 
