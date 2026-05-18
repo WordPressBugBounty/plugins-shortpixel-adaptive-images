@@ -1534,7 +1534,7 @@ $controller = $this->ctrl;
                                                     data-exclusion-type="urls"
                                                     data-setting="exclusion"
                                                     data-separator="<?= PHP_EOL; ?>"
-                                            ><?= $eager_paths; ?></textarea>
+                                            ><?= esc_textarea( (string) $eager_paths ); ?></textarea>
                                         </div>
                                         <div><label for="excluded_paths"><?= __( 'Leave out completely Url\'s:', 'shortpixel-adaptive-images' ); ?></label><br>
                                             <textarea
@@ -1545,7 +1545,7 @@ $controller = $this->ctrl;
                                                 data-exclusion-type="urls"
                                                 data-setting="exclusion"
                                                 data-separator="<?= PHP_EOL; ?>"
-                                            ><?= $excluded_paths; ?></textarea>
+                                            ><?= esc_textarea( (string) $excluded_paths ); ?></textarea>
                                         </div>
                                         <p class="description">
                                             <?= __( 'Exclude images based on their URL.'
@@ -1572,7 +1572,7 @@ $controller = $this->ctrl;
                                                     data-exclusion-type="urls"
                                                     data-setting="exclusion"
                                                     data-separator="<?= PHP_EOL; ?>"
-                                            ><?= $excluded_pages; ?></textarea>
+                                            ><?= esc_textarea( (string) $excluded_pages ); ?></textarea>
                                         </div>
                                         <p class="description" style="margin-bottom:16px">
                                             <?= __( 'Exclude entire pages based on their URL, so that none of the images on these pages are optimized.', 'shortpixel-adaptive-images' ); ?>
