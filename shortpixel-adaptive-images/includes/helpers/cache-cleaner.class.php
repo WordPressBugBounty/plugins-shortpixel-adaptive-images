@@ -162,6 +162,7 @@ class CacheCleaner
         //WP Fastest Cache
 
         //Generic cache, search for cache folders in wp-content/cache - only if we have a list of URLs otherwise we could delete too many things...
+        // URLs and paths are validated to block traversal and off-site referer abuse
         if(!$cache_cleared && $urls) {
             $cache_parent = WP_CONTENT_DIR . '/cache/';
             $caches = @scandir($cache_parent);
@@ -170,11 +171,20 @@ class CacheCleaner
                 if ($cache == '.' || $cache == '..') continue;
                 if(is_dir($cache_parent . $cache)) {
                     foreach($urls as $url) {
-                        $parsed = parse_url($url);
-                        $domain = isset($parsed['domain']) ? $parsed['domain'] : '';
-                        $path = isset($parsed['path']) ? $parsed['path'] : '';
-                        if(!($cache_cleared = $this->deleteHtmlFiles($cache_parent . $cache . DIRECTORY_SEPARATOR . $domain . $path))) {
-                            $cache_cleared = $this->deleteHtmlFiles($cache_parent . $cache . DIRECTORY_SEPARATOR . $path);
+                        if(!$this->isAllowedCacheClearUrl($url)) {
+                            $LOGGER_ON && $this->logger->log('Skipping disallowed cache URL: ' . $url);
+                            continue;
+                        }
+
+                        $path = wp_parse_url($url, PHP_URL_PATH);
+                        if(!is_string($path) || $path === '' || strpos($path, '..') !== false) {
+                            continue;
+                        }
+
+                        $relative_path = ltrim(wp_normalize_path($path), '/');
+                        $cache_dir = $cache_parent . $cache . DIRECTORY_SEPARATOR . $relative_path;
+                        if(($cache_cleared = $this->deleteHtmlFiles($cache_dir))) {
+                            break 2;
                         }
                     }
                 }
@@ -190,17 +200,88 @@ class CacheCleaner
         return $result;
     }
 
+    /**
+     * Delete .html/.htm files from a cache directory after path validation
+     *
+     * @param string $cache_path Candidate directory under wp-content/cache
+     * @return int Number of deleted files
+     */
     protected function deleteHtmlFiles($cache_path) {
+        // Never unlink before resolveCacheDirectory confirms the target stays inside wp-content/cache
+        $safe_path = $this->resolveCacheDirectory($cache_path);
+        if($safe_path === false) {
+            $this->LOGGER_ON && $this->logger->log('Rejected unsafe cache path: ' . $cache_path);
+            return 0;
+        }
+
         $counter = 0;
-        $cached_pages = @scandir($cache_path);
-        $this->LOGGER_ON && $this->logger->log('PATH to clear cache: ' . $cache_path . ' contains: ' . json_encode($cached_pages));
+        $cached_pages = @scandir($safe_path);
+        $this->LOGGER_ON && $this->logger->log('PATH to clear cache: ' . $safe_path . ' contains: ' . json_encode($cached_pages));
         if($cached_pages) foreach ($cached_pages as $cp) {
             if ($cp == '.' || $cp == '..') continue;
             if(preg_match('/\.html?$/', $cp)) {
-                $counter += @unlink(trailingslashit($cache_path) . $cp );
+                $counter += @unlink(trailingslashit($safe_path) . $cp );
             }
         }
         return $counter;
+    }
+
+    /**
+     * Resolve and validate a cache directory path before any filesystem delete
+     *
+     * Rejects traversal sequences, paths outside wp-content/cache, and non-directories
+     *
+     * @param string $cache_path Raw path built from a page URL
+     * @return string|false Real path when safe, false otherwise
+     */
+    protected function resolveCacheDirectory($cache_path) {
+        if(!is_string($cache_path) || $cache_path === '' || strpos($cache_path, "\0") !== false) {
+            return false;
+        }
+
+        $cache_root = realpath(WP_CONTENT_DIR . '/cache');
+        if($cache_root === false || !is_dir($cache_root)) {
+            return false;
+        }
+
+        $normalized = wp_normalize_path($cache_path);
+        if(preg_match('#(^|/)\.\.(/|$)#', $normalized)) {
+            return false;
+        }
+
+        $root_prefix = wp_normalize_path(WP_CONTENT_DIR . '/cache');
+        if(strpos($normalized, $root_prefix) !== 0) {
+            return false;
+        }
+
+        $real = realpath($normalized);
+        if($real === false || !is_dir($real)) {
+            return false;
+        }
+
+        $real = wp_normalize_path($real);
+        if(strpos($real, wp_normalize_path($cache_root)) !== 0) {
+            return false;
+        }
+
+        return $real;
+    }
+
+    /**
+     * Allow cache clearing only for URLs that belong to the current site host
+     *
+     * @param string $url Page URL used to locate cached HTML files
+     * @return bool
+     */
+    protected function isAllowedCacheClearUrl($url) {
+        if(!is_string($url) || $url === '') {
+            return false;
+        }
+
+        $host = wp_parse_url($url, PHP_URL_HOST);
+        $site_host = \ShortPixelDomainTools::get_site_domain();
+
+        return $host && $site_host && strcasecmp($host, $site_host) === 0;
     }
 
     public function excludeCurrentPage()

@@ -1013,8 +1013,11 @@
 			// LQ placeholder generating handler which ran by cron job
 			add_action( self::SCHEDULE[ 'name' ], [ $this, 'eventHandler' ] );
 
-			add_action( 'wp_ajax_shortpixel_ai_handle_lqip_action', [ 'ShortPixel\AI\LQIP\Actions', 'handle' ] );
-			add_action( 'wp_ajax_nopriv_shortpixel_ai_handle_lqip_action', [ 'ShortPixel\AI\LQIP\Actions', 'handle' ] );
+			// Front-end AJAX collect is only used in INSTANT mode (cron uses server-side processing)
+			if ( $this->process_way === self::USE_INSTANT ) {
+				add_action( 'wp_ajax_shortpixel_ai_handle_lqip_action', [ 'ShortPixel\AI\LQIP\Actions', 'handle' ] );
+				add_action( 'wp_ajax_nopriv_shortpixel_ai_handle_lqip_action', [ 'ShortPixel\AI\LQIP\Actions', 'handle' ] );
+			}
 
 			add_action( 'wp_enqueue_scripts', [ $this, 'enqueueScripts' ] );
 		}
@@ -1039,6 +1042,8 @@
                     'ajax_url'      => admin_url( 'admin-ajax.php' ),
 					'processWay'   => $this->process_way,
 					'localStorage' => $this->ctrl->options->settings_behaviour_localStorage,
+					// needed when lqip.js loads without jQuery bundle
+					'ajax_nonce'   => wp_create_nonce( 'shortpixel-ai-settings' ),
 				] );
 
                 \ShortPixelUrlTools::applyNonce('spai-lqip');

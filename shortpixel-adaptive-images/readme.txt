@@ -4,7 +4,7 @@ Tags: image optimization, convert, webp, lazy load, avif
 Requires at least: 4.7
 Tested up to: 7.0
 Requires PHP: 5.6.40
-Stable tag: 3.11.4
+Stable tag: 3.11.5
 License: GPLv2 or later
 License URI: http://www.gnu.org/licenses/gpl-2.0.html
 
@@ -248,6 +248,18 @@ This rule will only be applied by the New JS Engine (so you need to have the opt
 6. Advanced settings page
 
 == Changelog ==
+
+= 3.11.5 =
+
+🛡️ The Security Hardening Update
+
+Release Date: June 19, 2026
+
+🔒 Security Fix
+
+Arbitrary File Deletion Vulnerability Patched: Fixed an Arbitrary File Deletion vulnerability, responsibly and safely disclosed by the PatchStack team.
+
+We recommend updating to benefit from the latest security improvements and platform hardening. 🙌
 
 = 3.11.4 =
 

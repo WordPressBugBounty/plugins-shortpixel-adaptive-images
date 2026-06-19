@@ -92,7 +92,9 @@ function LQIP() {
 
 		formData.append( 'action', typeof window.lqipConstants === 'object' && ( typeof window.lqipConstants.action === 'string' && window.lqipConstants.action !== '' ) ? window.lqipConstants.action : 'shortpixel_ai_handle_lqip_action' );
 		formData.append( 'data[action]', 'collect' );
-		formData.append( 'data[referer]', window.location.href);
+		formData.append( 'spainonce', ( typeof window.lqipConstants === 'object' && typeof window.lqipConstants.ajax_nonce === 'string' )
+			? window.lqipConstants.ajax_nonce
+			: ( typeof window.spai_settings === 'object' && typeof window.spai_settings.ajax_nonce === 'string' ? window.spai_settings.ajax_nonce : '' ) );
 
 		if ( this.collection.length > 0 ) {
 			var formCollectionIndex = 0;
