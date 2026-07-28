@@ -14,6 +14,15 @@
 		 * Works via AJAX
 		 */
 		public static function handle() {
+			// Security: this handler is exposed via wp_ajax_ to every logged-in
+			// user. Verify the nonce (CSRF) and the capability (authorization)
+			// before dispatching, mirroring Page Actions (page.actions.class.php).
+			Page::checkSpaiNonce();
+
+			if ( ! \ShortPixelAI::userCan( 'manage_options' ) ) {
+				wp_send_json( [ 'success' => false ] );
+			}
+
 			$ctrl   = \ShortPixelAI::_();
 			$data   = $_POST[ 'data' ];
 			$causer = explode("___",$_POST[ 'causer' ]);

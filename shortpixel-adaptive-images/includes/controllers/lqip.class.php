@@ -141,6 +141,21 @@
             return $item;
         }
 
+        // Restores 'url'/'source' from 'lqipUrl' for items that went through normalizeLqipItem()
+        // Needed because the persisted collection (cron state) can contain normalized items
+        // that only carry 'lqipUrl', while generate()/filterWithProcessed() still read 'url'/'source' directly
+        private function denormalizeLqipItem(array $item): array {
+            if (!isset($item['url']) && isset($item['lqipUrl'])) {
+                $item['url'] = $item['lqipUrl'];
+            }
+
+            if (!isset($item['source']) && isset($item['lqipUrl'])) {
+                $item['source'] = $item['lqipUrl'];
+            }
+
+            return $item;
+        }
+
 
         private function provideTimestamp(array $collection): array {
             $now = time();
@@ -205,6 +220,11 @@
 
 		public static function clearCache() {
 		    SHORTPIXEL_AI_DEBUG && \ShortPixelAILogger::instance()->log('CLEARING CACHE in: ' . self::DIR);
+
+		    // always purge the queue/state option, regardless of whether the placeholder files exist
+		    // this makes sure stale or corrupted queue entries don't survive a manual cache clear
+		    delete_option( 'shortpixel_ai_lqip_state' );
+
 			if ( !file_exists( self::DIR ) || !is_dir( self::DIR ) ) {
 				return false;
 			}
@@ -357,7 +377,9 @@
 		private function schedule( $collection ) {
 			if ( !empty( $collection ) && is_array( $collection ) ) {
                 $state = $this->getLqipState();
-                $scheduled_collection = $state['collection'];
+                // items already saved in the state can be normalized (only 'lqipUrl' set)
+                // restore 'url'/'source' before merging with the freshly collected items below
+                $scheduled_collection = array_map( [ $this, 'denormalizeLqipItem' ], $state['collection'] );
 				$collection = array_merge( $scheduled_collection, $collection );
                 $collection = $this->provideTimestamp($collection);
                 $collection = $this->removeOldItemsFromCollection($collection);
@@ -412,6 +434,10 @@
                 $this->log( 'LQIP REQUESTS START. ALREADY PROCESSED: ', $processed );
 
                 foreach ( $collection as $index => $item ) {
+					// items coming from the persisted cron state can be normalized (only 'lqipUrl' set)
+					// restore 'url'/'source' before using them
+					$item = $this->denormalizeLqipItem( $item );
+
 					// flag to skip request if current URL has been already processed several times
 					// and process failed more than self::ATTEMPTS_QTY
 					$skip_request = false;
@@ -678,6 +704,10 @@
 				if ( empty( $processed ) ) {
 					return true;
 				}
+
+				// items coming from the persisted cron state can be normalized (only 'lqipUrl' set)
+				// restore 'url'/'source' before comparing them
+				$item = $this->denormalizeLqipItem( $item );
 
 				$pass = true;
 

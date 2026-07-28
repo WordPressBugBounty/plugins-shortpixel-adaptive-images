@@ -16,7 +16,7 @@
 		/**
 		 * @var string $template Notice template
 		 */
-		private static $template = '<div class="{{ NOTICE CLASSES }}" data-icon="{{ NOTICE ICON }}" data-causer="{{ CAUSER }}" data-plugin="short-pixel-ai"><div class="body-wrap"><div class="message-wrap">{{ MESSAGE }}</div><div class="buttons-wrap">{{ BUTTONS }}</div></div></div>';
+		private static $template = '<div class="{{ NOTICE CLASSES }}" data-icon="{{ NOTICE ICON }}" data-causer="{{ CAUSER }}" data-spainonce="{{ SPAI NONCE }}" data-plugin="short-pixel-ai"><div class="body-wrap"><div class="message-wrap">{{ MESSAGE }}</div><div class="buttons-wrap">{{ BUTTONS }}</div></div></div>';
 
 		/**
 		 * @var array $allowed_types Valid notice classes
@@ -120,13 +120,14 @@
 			}
 
 			return str_replace(
-				[ '{{ NOTICE CLASSES }}', '{{ NOTICE ICON }}', '{{ MESSAGE }}', '{{ BUTTONS }}', '{{ CAUSER }}' ],
+				[ '{{ NOTICE CLASSES }}', '{{ NOTICE ICON }}', '{{ MESSAGE }}', '{{ BUTTONS }}', '{{ CAUSER }}', '{{ SPAI NONCE }}' ],
 				[
 					implode( ' ', $notice_classes ),
 					empty( $data[ 'notice' ][ 'icon' ] ) ? 'none' : ( in_array( $data[ 'notice' ][ 'icon' ], self::$allowed_icons ) ? strtolower( $data[ 'notice' ][ 'icon' ] ) : 'none' ),
 					$message,
 					$buttons,
 					$causer,
+					wp_create_nonce( 'shortpixel-ai-settings' ),
 				],
 				self::$template );
 		}

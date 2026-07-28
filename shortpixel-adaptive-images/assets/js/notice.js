@@ -44,6 +44,7 @@
 							// this is AJAX action
 							action : 'shortpixel_ai_handle_notice_action',
 							causer : $notice.attr( 'data-causer' ),
+							spainonce : $notice.attr( 'data-spainonce' ),
 							data   : {
 								// action to be handled
 								action     : action,

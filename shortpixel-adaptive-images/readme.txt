@@ -4,7 +4,7 @@ Tags: image optimization, convert, webp, lazy load, avif
 Requires at least: 4.7
 Tested up to: 7.0
 Requires PHP: 5.6.40
-Stable tag: 3.11.5
+Stable tag: 3.11.6
 License: GPLv2 or later
 License URI: http://www.gnu.org/licenses/gpl-2.0.html
 
@@ -248,6 +248,22 @@ This rule will only be applied by the New JS Engine (so you need to have the opt
 6. Advanced settings page
 
 == Changelog ==
+
+= 3.11.6 =
+
+🛡️ The Security & PHP Compatibility Update
+
+Release Date: July 28, 2026
+
+ 🛡️ Security Fix
+
+- Authorization Bypass Patched: Fixed an authorization bypass vulnerability responsibly disclosed by the WordFence team.
+
+🛠️ Fixes & Improvements
+
+- PHP 8.4+ Compatibility: Resolved a PHP warning related to Low-Quality Image Placeholders (LQIPs) that could appear on PHP 8.4 and newer.
+
+Update now to benefit from the latest security improvements and enhanced compatibility. 🙌
 
 = 3.11.5 =
 
