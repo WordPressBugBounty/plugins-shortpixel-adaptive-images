@@ -7,11 +7,37 @@
 	use ShortPixel\AI\Options;
 	use ShortPixel\AI\Page;
 
+	/**
+	 * AJAX handler of the notice buttons (`wp_ajax_shortpixel_ai_handle_notice_action`, logged-in only).
+	 *
+	 * Request (sent by `assets/js/notice.js`): `action=shortpixel_ai_handle_notice_action`, `causer` (the notice's
+	 * `data-causer`), `spainonce` (the notice's `data-spainonce`), `data[action]`, optional `data[additional]`.
+	 * See the causer table on `\ShortPixel\AI\Notice` for every causer, its condition and its handler.
+	 *
+	 * Handlers return `null` for an action they do not handle, or an array
+	 * `{ success: bool, notice?: string, reload?: { allowed: bool }, redirect?: { allowed: bool, url: string } }`.
+	 */
 	class Actions {
 		/**
-		 * Main method of class, all action handlers should start with "handle{Causer}"
-		 * Method handles the notice's actions
-		 * Works via AJAX
+		 * Entry point: checks, resolves the handler from the causer and sends the JSON response.
+		 *
+		 * 1. `Page::checkSpaiNonce()`: bad/missing `spainonce` -> JSON `{ success: false, message }`.
+		 * 2. No `manage_options` -> JSON `{ success: false }`.
+		 * 3. `causer` is split with `explode( '___', … )`: part 0 is the causer, part 1 (if any) becomes
+		 *    `$data['causerId']` (remote notices). The handler is `'handle' . Converter::toTitleCase( causer )`
+		 *    (`wp rocket lazy` -> `handleWpRocketLazy`); `method_exists()` is case-insensitive, so `wprocketcss`
+		 *    reaches `handleWpRocketCss`. It is called with `( $data, ShortPixelAI::_() )` only when causer and
+		 *    `data` are non-empty.
+		 * 4. No handler, or a handler returning empty -> `{ success: false, notice: "Something went wrong... API key
+		 *    is invalid. …" }`.
+		 * The JSON is echoed with `header()` + `die`.
+		 *
+		 * @todo `handle()` answers every unmatched causer or action with the "API key is invalid" message, which has
+		 *       nothing to do with the request (e.g. the `lazy` X, `lqip mkdir failed`, `remote_get_error`). Send a
+		 *       generic "action not supported" error.
+		 * @todo `handle()` reads `$_POST['data']` and `$_POST['causer']` without `isset()`.
+		 *
+		 * @return void
 		 */
 		public static function handle() {
 			// Security: this handler is exposed via wp_ajax_ to every logged-in
@@ -59,6 +85,13 @@
 			die;
 		}
 
+        /**
+         * `recommend_survey`: `dismiss` stores `notices.dismissed.recommend_survey`.
+         *
+         * @param array $data
+         *
+         * @return null|array
+         */
         private static function handleRecommendSurvey( $data ) {
             if ( ( $data['action'] ?? '' ) === 'dismiss' ) {
                 return [
@@ -68,6 +101,13 @@
             return null;
         }
 
+        /**
+         * `remote_info_notice___<id>`: `dismiss` stores `notices.dismissed.remote_info_notice___<id>` (snake-cased).
+         *
+         * @param array $data `causerId` is set by `handle()` from the part after `___`.
+         *
+         * @return null|array
+         */
         private static function handleRemoteInfoNotice ($data){
             $action = isset($data['action']) ? $data['action'] : null;
             $causerId = $data['causerId'];
@@ -83,6 +123,18 @@
             return null;
         }
 
+		/**
+		 * `ao` (Autoptimize image optimisation conflict): `solve conflict` removes
+		 * `autoptimize_imgopt_checkbox_field_1` from `autoptimize_imgopt_settings`, or (Autoptimize <= 2.4.4)
+		 * `autoptimize_extra_checkbox_field_5` from `autoptimize_extra_settings`, and asks for a reload on success.
+		 *
+		 * @todo `handleAo()` shows "Please check the WP Rocket settings." when the Autoptimize fix fails; it should name
+		 *       Autoptimize. It also has no `return null` for other actions (returns void).
+		 *
+		 * @param array $data
+		 *
+		 * @return null|array
+		 */
 		private static function handleAo( $data ) {
 			// action which should be handled
 			$action = isset( $data[ 'action' ] ) ? $data[ 'action' ] : null;
@@ -127,7 +179,8 @@
 		}
 
 		/**
-		 * Method handles actions for "WP Rocket Defer JS"
+		 * `wp rocket defer js`: `solve conflict` sets WP Rocket `defer_all_js_safe = 1` (when
+		 * `update_rocket_option()` exists); `dismiss` stores `wp_rocket_defer_js`.
 		 *
 		 * @param array $data
 		 *
@@ -175,7 +228,9 @@
 		}
 
         /**
-         * Method handles actions for "WP Rocket Lazy"
+         * `lazy` (another lazy loader detected): only `dismiss forever` (the notice's button) stores `lazy`.
+         *
+         * The X sends `dismiss`, which is not handled (see the `@todo` on `\ShortPixel\AI\Notice`).
          *
          * @param array $data
          *
@@ -187,7 +242,7 @@
         }
 
         /**
-		 * Method handles actions for "WP Rocket Lazy"
+		 * `wp rocket lazy`: `dismiss` stores `wp_rocket_lazy`.
 		 *
 		 * @param array $data
 		 *
@@ -199,7 +254,8 @@
 		}
 
 		/**
-		 * Method handles actions for "WP Rocket CSS"
+		 * `wprocketcss` (reached case-insensitively): `dismiss` stores `wp_rocket_css`, but `Notice::renderNotices()`
+		 * checks `wprocketcss` (see the `@todo` on `\ShortPixel\AI\Notice`).
 		 *
 		 * @param array $data
 		 *
@@ -211,7 +267,9 @@
 		}
 
 		/**
-		 * Method handles actions for "Key"
+		 * `key` (a ShortPixel account exists for the domain): `use account` calls
+		 * `ShortPixelDomainTools::use_shortpixel_account()` (reuses the SPIO key) and dismisses `key` on success;
+		 * `dismiss` stores `key`. A failed `use account` returns null (generic error).
 		 *
 		 * @param array         $data
 		 * @param \ShortPixelAI $controller
@@ -255,7 +313,10 @@
 		}
 
 		/**
-		 * Method handles actions for "Credits"
+		 * `credits`: `check` refreshes the domain status (remote) and answers success only for `Status === 2`, with a
+		 * success/warning/error notice and a reload; `dismiss` stores `credits`.
+		 *
+		 * @todo `handleCredits()` reads `$domain_status->Status` without checking the remote result is an object.
 		 *
 		 * @param array         $data
 		 * @param \ShortPixelAI $controller
@@ -329,7 +390,8 @@
 		 */
 
 		/**
-		 * Method handles actions for "On-Boarding"
+		 * `on boarding` (notice currently never rendered): `redirect` sets `pages.on_boarding.display_allowed`,
+		 * dismisses `on_boarding` and redirects to the wizard; `dismiss` stores `on_boarding`.
 		 *
 		 * @param array $data
 		 *
@@ -358,7 +420,7 @@
 		}
 
 		/**
-		 * Method handles actions for "Beta"
+		 * `beta`: `dismiss` stores `beta = SHORTPIXEL_AI_VERSION` (the notice returns with the next version).
 		 *
 		 * @param array $data
 		 *
@@ -370,7 +432,7 @@
 		}
 
 		/**
-		 * Method handles actions for "Twice lossy"
+		 * `twicelossy`: `dismiss` stores `twicelossy`.
 		 *
 		 * @param array $data
 		 *
@@ -390,7 +452,9 @@
 		}
 
 		/**
-		 * Method handles actions for "Missing jQuery"
+		 * `missing jquery`: `re-check` sets `tests.front_end.enqueued = true`, `missing_jquery = false` and redirects
+		 * to `home_url() . '?return_to=' . urlencode( data[additional][return_url] )` so the front-end test runs again;
+		 * `dismiss` stores `missing_jquery`.
 		 *
 		 * @param array $data
 		 *
@@ -419,7 +483,11 @@
 		}
 
         /**
-         * Method handles actions for "Temporary Redirect"
+         * `temporary redirect`: `re-check` only redirects to `data[additional][return_url]` (no server-side recheck
+         * exists); `dismiss` stores `missing_jquery` (see the `@todo` on `\ShortPixel\AI\Notice`).
+         *
+         * @todo `handleTemporaryRedirect()` `re-check` returns the client-supplied `return_url` as redirect target
+         *       unvalidated; pass it through `wp_validate_redirect()`.
          *
          * @param array $data
          *
@@ -450,7 +518,8 @@
         }
 
         /**
-		 * Method handles actions for "Swift Performance"
+		 * `swift performance`: `solve conflict` empties Swift Performance (Lite and/or Pro) `merge-styles` and
+		 * `normalize-static-resources` and clears its cache on success; `dismiss` stores `swift_performance`.
 		 *
 		 * @param array $data
 		 *
@@ -512,7 +581,7 @@
 		}
 
 		/**
-		 * Method handles actions for "Imagify"
+		 * `imagify`: `solve conflict` sets Imagify `display_webp = 0`; `dismiss` stores `imagify`.
 		 *
 		 * @param array $data
 		 *
@@ -558,7 +627,8 @@
 		}
 
 		/**
-		 * Method handles actions for "SPIO WebP Delivering"
+		 * `spio webp`: `solve conflict` sets the SPIO option `wp-short-pixel-create-webp-markup = 0`; `dismiss` stores
+		 * `spio_webp`.
 		 *
 		 * @param array $data
 		 *
@@ -606,7 +676,8 @@
 		}
 
 		/**
-		 * Method handles actions for "LiteSpeed Cache's JS Combine"
+		 * `litespeed js combine`: `solve conflict` empties `litespeed.conf.optm-js_comb`; `dismiss` stores
+		 * `litespeed_js_combine`.
 		 *
 		 * @param array $data
 		 *
@@ -654,7 +725,9 @@
 		}
 
 		/**
-		 * Method handles actions for "WP Optimize CSS options"
+		 * `wpo merge css`: `solve conflict` sets WP-Optimize minify `enable_merging_of_css = false`; `add exclusions`
+		 * appends the plugin's `admin(.min).css` and `style-bar(.min).css` paths to its `ignore_list`; `dismiss` stores
+		 * `wpo_merge_css`. Both fixes report success whenever the config object has `get`/`update`.
 		 *
 		 * @param array $data
 		 *
@@ -764,6 +837,16 @@
 			return null;
 		}
 
+        /**
+         * Dismisses `$causer` when `data[action]` equals `$dismissAction`.
+         *
+         * @param array       $data          Request data.
+         * @param string      $causer        Causer to store (snake-cased on save).
+         * @param mixed|null  $value         Stored value; null means `time()`.
+         * @param string      $dismissAction Action that triggers the dismissal.
+         *
+         * @return null|array `{ success }` or null when the action does not match.
+         */
         private static function justDismiss($data, $causer, $value = null, $dismissAction = 'dismiss') {
             $action = isset( $data[ 'action' ] ) ? $data[ 'action' ] : null;
             if ( $action === $dismissAction ) {

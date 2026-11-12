@@ -1,16 +1,59 @@
 <?php
 /**
- * User: simon
- * Date: 11.06.2019
+ * DOM-based HTML rewriter. DEAD CODE: never instantiated.
+ *
+ * The root plugin file requires this file, so the class is declared on every request, but
+ * `ShortPixelAI::__construct()` hardcodes `ShortPixelRegexParser` (the line creating this parser
+ * is commented out) and nothing else references it.
+ *
+ * @package ShortPixel\AI
  */
 
+/**
+ * Abandoned alternative to `ShortPixelRegexParser` built on the simple_html_dom library.
+ *
+ * It cannot run as is:
+ * 1. `parse()` calls `str_get_html()`, and `parseNode()` uses `HDOM_TYPE_ELEMENT` /
+ *    `HDOM_TYPE_TEXT`; simple_html_dom is not bundled, so the call is a fatal
+ *    "undefined function" error (and the constants an "undefined constant" Error on PHP 8).
+ * 2. `parseNode()` calls `parseVisualNode($node, $exceptions)` with 2 arguments but the method
+ *    requires 4: ArgumentCountError.
+ * 3. `replaceUrl()` reads `->image` / `->meta` on the string that
+ *    `ShortPixelUrlTools::generate_placeholder_svg()` returns.
+ * Further: `$rulesMap` / `$exceptions` are dynamic properties (deprecated since PHP 8.2), the
+ * `in_array()` arguments in `parseVisualNode()` are reversed, and `$cssClasses` is undefined
+ * there when the node has no `class` attribute.
+ *
+ * @todo ShortPixelSimpleDomParser is dead and unusable (missing library, wrong argument count,
+ *       string used as object). Delete the class and its `require_once` in the root plugin file,
+ *       together with `TagRules::map()` and `ShortPixelCssParser::replace_in_tag_style_backgrounds()`.
+ */
 class ShortPixelSimpleDomParser {
+    /**
+     * @var ShortPixelAI The plugin controller.
+     */
     protected $ctrl;
+    /**
+     * @var bool Global lazy switch; combined with each rule's `lazy` flag in `replaceUrl()`.
+     */
     protected $lazy = true;
 
+    /**
+     * @var ShortPixelAILogger Shared logger instance.
+     */
     private $logger;
+    /**
+     * @var ShortPixelCssParser The controller's CSS parser.
+     */
     private $cssParser;
 
+    /**
+     * Stores the controller, logger and CSS parser, builds `$this->rulesMap` from
+     * `TagRules::_()->map()` and sets `$this->exceptions` to an empty array (the loop over
+     * `$ctrl->exclusions` has an empty body). Both are undeclared (dynamic) properties.
+     *
+     * @param ShortPixelAI $ctrl The plugin controller.
+     */
     public function __construct(ShortPixelAI $ctrl)
     {
         $this->ctrl = $ctrl;
@@ -25,6 +68,13 @@ class ShortPixelSimpleDomParser {
         //$this->lazy = true; //TODO option
     }
 
+    /**
+     * Intended to load `$content` into a simple_html_dom tree, rewrite every node and return the
+     * tree. Fatal: `str_get_html()` is undefined (library not bundled).
+     *
+     * @param string $content HTML.
+     * @return object The simple_html_dom document (never reached).
+     */
     public function parse($content)
     {
         $this->logger->log('******** DOM PARSER *********');
@@ -40,6 +90,16 @@ class ShortPixelSimpleDomParser {
         return $dom;
     }
 
+    /**
+     * Visits a node recursively: `<style>` bodies go through
+     * `ShortPixelCssParser::replace_inline_style_backgrounds()`, `<script>` and `<link>` are left
+     * alone, other elements go to `parseVisualNode()` (with 2 of its 4 required arguments, which
+     * throws ArgumentCountError), text nodes are logged.
+     *
+     * @param object $node       simple_html_dom node.
+     * @param array  $exceptions Unused exclusion list (always empty).
+     * @return void
+     */
     private function parseNode(&$node, $exceptions) {
 
         //$this->logger->log("SIMPLE Node class " . get_class($node));
@@ -86,6 +146,12 @@ class ShortPixelSimpleDomParser {
         }
     }
 
+    /**
+     * Logs a node's tag, attributes and CSS classes.
+     *
+     * @param object $node simple_html_dom node.
+     * @return void
+     */
     private function logNode($node) {
         $attributes = " ATTRIBUTES: ";
         $cssClasses = array();
@@ -100,6 +166,17 @@ class ShortPixelSimpleDomParser {
         $this->logger->log( 'CHECKING ' . $node->tag . $attributes . " CSS class: ", $cssClasses);
     }
 
+    /**
+     * Applies the `TagRules::map()` rules for the node's tag plus the `*` rule: filters by
+     * attribute, attribute value and class, then calls the rule's `customReplacer` or
+     * {@see replaceUrl()}; sets `data-spai="1"` when anything changed.
+     *
+     * @param object $node     simple_html_dom node.
+     * @param mixed  $exclude  Unused.
+     * @param mixed  $noresize Unused.
+     * @param mixed  $eager    Unused.
+     * @return void
+     */
     private function parseVisualNode(&$node, $exclude, $noresize, $eager) {
 
         if(isset($node->attr['class'])) {
@@ -147,6 +224,16 @@ class ShortPixelSimpleDomParser {
         }
     }
 
+    /**
+     * Replaces the rule attribute's URL with a placeholder (lazy) or CDN URL (eager), picking the
+     * widest valid candidate of the merge attribute first. Written against the obsolete
+     * placeholder API (object with `image` and `meta`); with the current string return value the
+     * lazy branch reads properties of a string.
+     *
+     * @param object $node simple_html_dom node.
+     * @param object $rule Rule node from `TagRules::map()`.
+     * @return bool True when the attribute was replaced.
+     */
     private function replaceUrl(&$node, $rule) {
         $url = $node->attr[$rule->attr];
         //$this->logger->log( 'MATCHES RULE ' . $node->tag  . " with " . $rule->attr . " VALUE: " . $url);

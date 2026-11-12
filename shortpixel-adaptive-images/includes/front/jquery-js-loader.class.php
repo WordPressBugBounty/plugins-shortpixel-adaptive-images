@@ -1,17 +1,65 @@
 <?php
 /**
- * Created by simon
- * Date: 19.01.2021
+ * Legacy jQuery front-end engine loader.
  */
 
 namespace ShortPixel\AI;
 
+/**
+ * jQuery mode (`settings.behaviour.nojquery <= 0`): enqueues `assets/js/ai-2.0[.min].js` (handle `spai-scripts`, depends on
+ * `jquery`) with the `spai_settings` object, and injects the affected tags recorded during AJAX.
+ */
 class JqueryJsLoader extends JsLoader {
 
+    /**
+     * Only through `JsLoader::_()`.
+     */
     protected function __construct() {
         parent::__construct();
     }
 
+    /**
+     * Enqueues the jQuery engine.
+     *
+     * For `manage_options` users with `tests.front_end.enqueued` it first enqueues `spai-tests` (`ai.tests.js`, deferred).
+     * Then registers `spai-scripts` and localizes `spai_settings` with these keys:
+     * - `api_domain`: host of `get_cdn_url()`;
+     * - `api_url`: `get_api_url( false, '%WIDTH%', '%HEIGHT%', 'noauto' )` (prefix with `w_%WIDTH%`, no `to_` token: the JS adds it per extension);
+     * - `api_short_url`: `get_api_url( false, false, false, 'svg' )` (only-store prefix: `ret_img` [+ `p_h`]);
+     * - `method`: `behaviour.replace_method` (`src` | `srcset` | `both`);
+     * - `crop`: bool `behaviour.crop`;
+     * - `size_breakpoints`: `{on, base, rate}` from `behaviour.size_breakpoints`, `_base`, `_rate`;
+     * - `lqip`: bool `behaviour.lqip`;
+     * - `lazy_threshold`: `behaviour.lazy_threshold` when an int >= 0, else 500;
+     * - `hover_handling`: bool `behaviour.hover_handling`;
+     * - `native_lazy`: bool `areas.native_lazy`;
+     * - `serve_svg`: always true;
+     * - `debug`: `SHORTPIXEL_AI_DEBUG`;
+     * - `site_url`: `home_url()` through filter `shortpixel/ai/originalUrl`;
+     * - `plugin_url`: `SHORTPIXEL_AI_PLUGIN_BASEURL`; `version`: `SHORTPIXEL_AI_VERSION`;
+     * - `excluded_selectors`, `eager_selectors`, `noresize_selectors`: arrays split on `,` (Modula adds `.modula-creative-gallery img.pic` to eager and noresize);
+     * - `alter2wh`: bool `behaviour.alter2wh`;
+     * - `use_first_sizes`: `ActiveIntegrations::getUseFirstSizes()` (WooCommerce gallery selector map or []);
+     * - `lazy_bg_style`: bool `areas.backgrounds_lazy_style`;
+     * - `active_integrations`: `ActiveIntegrations::getAll()`;
+     * - `parse_css_files`: `areas.parse_css_files > 0`;
+     * - `backgrounds_max_width`: `areas.backgrounds_max_width` when an int >= 0, else 1920;
+     * - `sep`: `ShortPixelAI::SEP`;
+     * - `webp`, `avif`: bools from `compression`;
+     * - `webp_detect`: `!ShortPixelAI::$varyCacheSupport`;
+     * - `extensions_to_nextgenimg`: `{png, jpg, gif}` = (webp || avif) && `<ext>_to_webp`;
+     * - `sniper`: URL of `assets/img/target.cur`;
+     * - `affected_tags`: the literal `{{SPAI-AFFECTED-TAGS}}`, replaced by `addTagData()`;
+     * - `ajax_url`: admin-ajax URL; `ajax_nonce`: nonce `shortpixel-ai-settings`;
+     * - `excluded_paths`, `eager_paths` (kept last for a Swift Performance HTML fix): lines split on PHP_EOL, each base64-encoded.
+     * With WP Rocket active adds filter `rocket_defer_inline_exclusions` -> `wp_rocket_no_defer_spai_settings()`. Then calls `parent::enqueue()`.
+     *
+     * @return void
+     * @todo `native_lazy` in `JqueryJsLoader::enqueue()` reads `areas.native_lazy`; the setting lives in `behaviour.native_lazy`
+     *       (settings page, regex parser, vanilla loader), so jQuery mode always gets the stale/missing value. Read `behaviour->native_lazy`.
+     * @todo In `lazy_threshold` and `backgrounds_max_width` the `(int)` cast applies to `is_int()`, not to the value, so a numeric-string
+     *       setting (e.g. `'300'`) falls back to the default. Use `is_numeric()` and cast the value.
+     */
     public function enqueue() {
         $testFE = false;
         if ( current_user_can( 'manage_options' ) && !!$this->ctrl->options->tests_frontEnd_enqueued ) {
@@ -81,6 +129,12 @@ class JqueryJsLoader extends JsLoader {
         parent::enqueue();
     }
 
+    /**
+     * Filter `rocket_defer_inline_exclusions`: keeps the inline `spai_settings` script out of WP Rocket's deferral.
+     *
+     * @param string|string[] $regex Regex string (`|`-joined) or list
+     * @return string|string[]
+     */
     public function wp_rocket_no_defer_spai_settings($regex) {
         if( is_string( $regex ) ){
             return $regex . '|spai_settings';
@@ -89,6 +143,13 @@ class JqueryJsLoader extends JsLoader {
         return $regex;
     }
 
+    /**
+     * Replaces `{{SPAI-AFFECTED-TAGS}}` in the localized `spai_settings` with `addslashes( json_encode( AffectedTags::getAll() ) )`;
+     * when the placeholder is absent, inserts `<script>var spai_affectedTags = "<same>";</script>` before `</body>`.
+     *
+     * @param string $content
+     * @return string
+     */
     public function addTagData($content)
     {
         if ( strpos( $content, '{{SPAI-AFFECTED-TAGS}}' ) ) {
@@ -102,11 +163,23 @@ class JqueryJsLoader extends JsLoader {
         return $content;
     }
 
+    /**
+     * True while `spai-scripts` is still enqueued (`wp_script_is()`); `$content` is not inspected.
+     *
+     * @param string $content Unused
+     * @return bool
+     */
     public function check($content)
     {
         return wp_script_is('spai-scripts');
     }
 
+    /**
+     * Adds the inline style `spai-fadein`: `img[data-spai]` starts at opacity 0 (except inside `div.woocommerce-product-gallery`),
+     * and `img[data-spai-egr]`, `img[data-spai-lazy-loaded]`, `img[data-spai-upd]` fade to opacity 1 (.5s linear, .2s delay).
+     *
+     * @return void
+     */
     public function fadeInCss()
     {
         wp_register_style( 'spai-fadein', false );

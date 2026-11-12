@@ -2,7 +2,28 @@
 
 	namespace ShortPixel\AI\Page;
 
+	/**
+	 * Texts and markup of the on-boarding wizard (and the social share block).
+	 *
+	 * Used by `on-boarding.tpl.php` and `Page\Actions::handleOnBoarding()` (step count and next-step message).
+	 * The constructor makes two remote calls: `ShortPixelDomainTools::get_domain_status( true )` (refreshed) and
+	 * `get_cdn_domain_usage()` with the SPAI key, or the SPIO key (`wp-short-pixel-apiKey`) when SPAI has none.
+	 *
+	 * The step messages carry the `data-action` buttons handled by `Page\Actions::handleOnBoarding()`:
+	 * `go to settings`, `run front worker`, `save key` (with an `api_key` input), `use same account`; plus `.next_icon`
+	 * and `.done` buttons handled by `on-boarding.js`.
+	 *
+	 * @todo The constructor's step 0 and step 1 messages open `<button ... data-action="go to settings">` and close it
+	 *       with `</a>`; close them with `</button>`.
+	 * @todo The constructor's "use the same account" `__()` call has no text domain; add `'shortpixel-adaptive-images'`.
+	 * @todo The constructor reads `$domain_status->HasAccount` without checking the remote result is an object, and
+	 *       puts `home_url()` unencoded into the GTMetrix `?url=` links (`?PageSpeed=off` becomes part of the GTMetrix
+	 *       query). Guard the result and `urlencode()` the URL.
+	 */
 	class Constants {
+		/**
+		 * @var \ShortPixel\AI\Page\Constants|null The singleton, set by the first constructor call.
+		 */
 		private static $instance;
 
 		/**
@@ -10,12 +31,18 @@
 		 */
 		private $ctrl = null;
 
+		/**
+		 * @var array{titles: string[], messages: string[]} $onBoarding Wizard step titles (Check, Configure, Measure,
+		 *                                                    Credits) and the HTML message of each step, same order.
+		 */
 		public $onBoarding;
 
 		/**
-		 * Single ton implementation
+		 * Returns the singleton, creating it on first call.
 		 *
-		 * @param \ShortPixelAI $controller
+		 * The first call must pass the controller: the constructor reads `$this->ctrl->options`.
+		 *
+		 * @param \ShortPixelAI|null $controller
 		 *
 		 * @return \ShortPixel\AI\Page\Constants
 		 */
@@ -23,10 +50,27 @@
 			return self::$instance instanceof self ? self::$instance : new self( $controller );
 		}
 
+		/**
+		 * Echoes `getSocialBlock()`.
+		 *
+		 * @param array $arguments Extra or overriding networks, see `getSocialBlock()`.
+		 *
+		 * @return void
+		 */
 		public function renderSocialBlock( $arguments = [] ) {
 			echo $this->getSocialBlock( $arguments );
 		}
 
+		/**
+		 * Returns the "share it" block: `<div class="socials-block">` with one `<a href data-social>` per network.
+		 *
+		 * Default networks are `twitter` (tweet intent with a fixed text, hashtags and the plugin's wp.org URL) and
+		 * `facebook` (sharer link). `$arguments` is `array_merge()`d over them.
+		 *
+		 * @param array<string, array{link: string, action: string}> $arguments Networks keyed by name.
+		 *
+		 * @return string HTML (links and texts are not escaped).
+		 */
 		public function getSocialBlock( $arguments = [] ) {
 			$socials = [
 				'twitter'  => [
@@ -56,9 +100,15 @@
 		}
 
 		/**
-		 * Constants constructor.
+		 * Builds `$onBoarding` (see class docblock for the remote calls).
 		 *
-		 * @param \ShortPixelAI $controller
+		 * The credits step (last) shows, depending on the domain status: the associated message with an API key
+		 * field prefilled with the SPAI or SPIO key (when the domain has an account and usage data), the same with an
+		 * empty field (account but no usage data), a "use the same account" button (no account, SPIO key present),
+		 * or create-account/associate links (affiliate link via the `spai_affiliate_link` filter; `/af/LVENHYZ28044` is
+		 * appended when the filtered FSU URL has exactly 4 `/`-separated parts).
+		 *
+		 * @param \ShortPixelAI|null $controller
 		 */
 		private function __construct( $controller = null ) {
 			if ( !isset( self::$instance ) || !self::$instance instanceof self ) {

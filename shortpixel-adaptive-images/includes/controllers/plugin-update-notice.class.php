@@ -1,8 +1,45 @@
 <?php
 namespace ShortPixel\AI;
 
+/**
+ * Extra text under the plugin's "There is a new version" row on the Plugins screen.
+ *
+ * Hooked by `ShortPixelAI` on `in_plugin_update_message-<plugin basename>` (priority 10, 2 args). Sources:
+ * - a PHP compatibility warning built from `$response->requires_php`;
+ * - a "major"/"minor" heads-up computed from `$response->new_version`;
+ * - the matching block of the `== Upgrade Notice ==` section of
+ *   `https://plugins.svn.wordpress.org/shortpixel-adaptive-images/trunk/readme.txt`, cached one day in the transient
+ *   `spai_update_notice_<new_version>`.
+ *
+ * Readme block grammar (inside `== Upgrade Notice ==`):
+ *
+ *     = 3.1.0 =
+ *     **Bold**, __italic__ and [links](https://…) are converted; one `<span>` per line.
+ *     Placeholders: {{ NEW VERSION }}, {{ CURRENT VERSION }}, {{ PHP VERSION }}, {{ REQUIRED PHP VERSION }}
+ *     = 3.1.0:END =
+ *
+ * A block without its `:END` marker runs to the end of the file. The version tried, in order, is
+ * `maj.min.micro.build`, `maj.min.micro`, `maj.min.0`, `maj.min`, `maj.0.0`, `maj.0`, skipping candidates lower than
+ * the installed `SHORTPIXEL_AI_VERSION`; the first block found wins.
+ */
 class PluginUpdateNotice {
 
+    /**
+     * Echoes the update notice for the plugin row.
+     *
+     * When the running PHP is older than `requires_php` it echoes only the "do not update" warning. Otherwise it adds
+     * "x is a major update" (new version `X.0` / `X.0.0` above the installed one) or "x is a minor update"
+     * (`X.Y` / `X.Y.0`, `Y != 0`, above the installed one), then the readme notice. Output goes through
+     * `wp_kses_post()`.
+     *
+     * @todo `in_plugin_update_message()` passes `$response->requires_php` to `version_compare()` without checking it is
+     *       set (null on PHP 8.1+ is deprecated) and reads `$version_parts[1]` without checking the version has a dot.
+     *
+     * @param array  $data     Plugin data row (unused).
+     * @param object $response Update API response (`new_version`, `requires_php`, …).
+     *
+     * @return void
+     */
     public static function in_plugin_update_message( $data, $response ) {
         $version_parts = explode( '.', $response->new_version );
 
@@ -33,11 +70,18 @@ class PluginUpdateNotice {
 
 
     /**
-     * Get the upgrade notice from WordPress.org.
+     * Returns the readme upgrade notice for `$response->new_version`, from the transient or from wordpress.org.
+     *
+     * Fetches the trunk `readme.txt` with `Request::get( …, false )` on a transient miss and caches the parsed result
+     * (possibly `''`) for `DAY_IN_SECONDS`. An empty response is not cached, so it is fetched again next time.
+     *
+     * @todo `get_update_notice()` passes the `Request::get()` result to `substr()` for logging and to the parser
+     *       without checking `is_wp_error()`; on a transport error `substr( WP_Error )` throws a `TypeError` on PHP 8.
+     *       Treat a `WP_Error` as empty (and cache the miss briefly).
      *
      * @param object $response WordPress response
      *
-     * @return string
+     * @return string|false Notice HTML; false when nothing is cached and the download is empty.
      */
     private static function get_update_notice( $response ) {
         \ShortPixelAILogger::instance()->log("UPDATE NOTICE?", $response);
@@ -62,12 +106,12 @@ class PluginUpdateNotice {
     }
 
     /**
-     * Parse update notice from readme file.
+     * Finds the first matching upgrade-notice block (see the version order in the class docblock).
      *
      * @param string $content  ShortPixel AI readme file content
      * @param object $response WordPress response
      *
-     * @return string
+     * @return string `wp_kses_post()`ed notice HTML, `''` when no block matches.
      */
     private static function parse_update_notice( $content, $response ) {
         $version_parts     = explode( '.', $response->new_version );
@@ -103,13 +147,15 @@ class PluginUpdateNotice {
     }
 
     /**
-     * Parses readme file's content to find notice related to passed version
+     * Extracts the `= $version =` … `= $version:END =` block (or `= $version =` to end of file) that follows
+     * `== Upgrade Notice ==`, and renders each non-empty line as `<span>` after `markdown2html()` and
+     * `replace_readme_constants()`. Matching is case-insensitive and ungreedy.
      *
      * @param string $content Readme file content
      * @param string $version Checked version
      * @param object $response WordPress response
      *
-     * @return string
+     * @return string Notice HTML or `''`.
      */
     private static function parse_readme_content( $content, $version, $response ) {
         $notice_regexp = '/==\s*Upgrade Notice\s*==.*=\s*(' . preg_quote( $version ) . ')\s*=(.*)(=\s*' . preg_quote( $version . ':END' ) . '\s*=|$)/Uis';
@@ -131,6 +177,15 @@ class PluginUpdateNotice {
         return $notice;
     }
 
+    /**
+     * Replaces `{{ NEW VERSION }}`, `{{ CURRENT VERSION }}`, `{{ PHP VERSION }}` and `{{ REQUIRED PHP VERSION }}` with
+     * `$response->new_version`, `SHORTPIXEL_AI_VERSION`, `PHP_VERSION` and `$response->requires_php`.
+     *
+     * @param string $content
+     * @param object $response Update API response.
+     *
+     * @return string
+     */
     private static function replace_readme_constants( $content, $response ) {
         $constants    = [ '{{ NEW VERSION }}', '{{ CURRENT VERSION }}', '{{ PHP VERSION }}', '{{ REQUIRED PHP VERSION }}' ];
         $replacements = [ $response->new_version, SHORTPIXEL_AI_VERSION, PHP_VERSION, $response->requires_php ];
@@ -138,6 +193,14 @@ class PluginUpdateNotice {
         return str_replace( $constants, $replacements, $content );
     }
 
+    /**
+     * Converts the readme's inline markdown: `**bold**` -> `<strong>`, `__italic__` -> `<em>`, `[text](url)` ->
+     * `<a href="url" target="_blank">text</a>`. Nothing else (no escaping).
+     *
+     * @param string $content One line of text.
+     *
+     * @return string Converted line, or the input when `preg_replace()` fails.
+     */
     public static function markdown2html( $content ) {
         $patterns = [
             '/\*\*(.+)\*\*/U', // bold

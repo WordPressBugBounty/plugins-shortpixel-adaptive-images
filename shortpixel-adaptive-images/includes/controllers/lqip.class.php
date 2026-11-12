@@ -7,14 +7,53 @@
 	use RecursiveDirectoryIterator;
 	use RecursiveIteratorIterator;
 
+	/**
+	 * Low Quality Image Placeholders: fetches blurred SVG placeholders from the CDN and caches them on disk.
+	 *
+	 * Cache layout: `<uploads>/spai/lqip/<first 2 chars of the name>/<md5(source URL)>.lqip.svg` (`self::DIR`), plus an
+	 * `index.html` (noindex) in `self::DIR`. When the old directory `<uploads>/shortpixel-adaptive-images/lqip` (`self::OLD_DIR`)
+	 * exists and the new one does not, `createMainDir()` moves its content and removes the old parent. Without an uploads dir both
+	 * fall back to the plugin directory. A failed `mkdir` sets transient `spai_lqip_mkdir_failed` (12 h).
+	 * Files expire after `LIFETIME` (7 days, by mtime).
+	 *
+	 * State: option `shortpixel_ai_lqip_state` = `['collection' => item[], 'processed' => result[]]`.
+	 * - collection item: `url` (absolute URL sent to the CDN), `source` (URL as found in the page, hashed for the file name),
+	 *   `referer` (page URL or false), `timestamp`; items saved after `normalizeLqipItem()` may carry `lqipUrl` instead of `url`/`source`.
+	 * - processed result: `url`, `source`, `file` (name or false), `type` (`lqip` | `bip` | false), `is_created`, `message`, `attempts`.
+	 * On first read the legacy `Options` keys `lqip.collection` / `lqip.processed` are copied into the option and deleted.
+	 *
+	 * Modes (`settings.behaviour.process_way`, invalid values fall back to `cron`):
+	 * - `cron`: placeholders recorded while parsing (`ShortPixelAI::$blankInlinePlaceholders`) are queued by `schedule()`;
+	 *   cron event `spai_lqip_generate_event` runs `eventHandler()`, which generates `BUNDLE_CAPACITY` (20) items per run and
+	 *   re-schedules itself on the custom `every-minute` interval (60 s) while items remain, else unschedules.
+	 *   `twicedaily` is the fallback recurrence for an unknown name.
+	 * - `instant`: `lqip.js` posts collections to AJAX `shortpixel_ai_handle_lqip_action` (+ `nopriv`), handled by
+	 *   `LQIP\Actions::handle()`, and `process()` generates them synchronously.
+	 * CDN request: `https://cdn.shortpixel.ai/spai/q_lqip+ret_wait/<absolute url with scheme>` (`API_URL`). A body is accepted when it
+	 * is an SVG containing `feGaussianBlur` or `filter="blur`. After `ATTEMPTS_QTY` recorded failures the blank `DEFAULT_PLACEHOLDER`
+	 * is written instead. Before saving, the SVG gets `data-u="%URL%" data-w=".." data-h=".."` and goes through the filter
+	 * `shortpixel/ai/lqip/beforeSave` (string $content, string $name).
+	 *
+	 * Static state a test must reset: private static `LQIP::$instance` (reflection); also delete the option and `self::DIR`.
+	 */
 	class LQIP {
 		/**
-		 * Directory path to placeholders
+		 * Legacy placeholder directory (`<uploads>/<plugin dir name>/lqip`), migrated by `createMainDir()`.
 		 * @var string
 		 */
 		const OLD_DIR = ( SHORTPIXEL_AI_WP_UPLOADS_DIR ? SHORTPIXEL_AI_WP_UPLOADS_DIR : SHORTPIXEL_AI_PLUGIN_DIR )
 		            . DIRECTORY_SEPARATOR . ( SHORTPIXEL_AI_WP_UPLOADS_DIR ? SHORTPIXEL_AI_PLUGIN_BASEDIR . DIRECTORY_SEPARATOR : '' ) . 'lqip';
 
+        /**
+         * Current placeholder directory `<uploads>/spai/lqip`.
+         *
+         * @todo DIR (and OLD_DIR) are fixed at load time from `SHORTPIXEL_AI_WP_UPLOADS_DIR`, the uploads
+         *       directory of the site that loaded the plugin; after `switch_to_blog()` a subsite's
+         *       placeholders are written to and cleared from the main site's directory. Resolve the
+         *       directory from `wp_upload_dir()` at use time.
+         *
+         * @var string
+         */
         const DIR = ( SHORTPIXEL_AI_WP_UPLOADS_DIR ? SHORTPIXEL_AI_WP_UPLOADS_DIR : SHORTPIXEL_AI_PLUGIN_DIR )
         . DIRECTORY_SEPARATOR . 'spai' . DIRECTORY_SEPARATOR . 'lqip';
 
@@ -27,13 +66,14 @@
 
 		/**
 		 * Directories default permissions in octal system
-		 * Default: 0775
+		 * Default: 0755
 		 * @var int
 		 */
 		const DIR_PERMISSIONS = 0755;
 
 		/**
-		 * Url to API-endpoint to receive placeholders
+		 * Url to API-endpoint to receive placeholders: `https://cdn.shortpixel.ai/spai/q_lqip+ret_wait`
+		 * (`/<absolute image URL with scheme>` is appended). `ret_wait` exists only here.
 		 * @var string
 		 */
 		const API_URL = ShortPixelAI::DEFAULT_API_AI . '/spai/q_lqip' . ShortPixelAI::SEP . 'ret_wait';
@@ -58,7 +98,7 @@
 		];
 
 		/**
-		 * Name of the category stored in "Options"
+		 * Name of the category stored in "Options" (legacy home of `collection` / `processed`, now only cleaned up)
 		 * @var string
 		 */
 		const OPTIONS_CATEGORY = 'lqip';
@@ -92,6 +132,10 @@
 		 */
 		const ATTEMPTS_QTY = 3;
 
+		/**
+		 * Process ways (`settings.behaviour.process_way` values).
+		 * @var string
+		 */
 		const USE_CRON = 'cron';
 		const USE_INSTANT = 'instant';
 
@@ -119,6 +163,18 @@
 		 */
 		private $ctrl;
 
+        /**
+         * Collapses `source`/`url` into `lqipUrl` before an item is stored in the cron state.
+         *
+         * Same values: both removed, `lqipUrl` = url. Different values: logged, `source` set to null, `lqipUrl` = url, `url` removed.
+         * Items without both keys are returned unchanged.
+         *
+         * @param array $item
+         * @return array
+         * @todo When `source` differs from `url` (relative or protocol-relative page URL in cron mode), `normalizeLqipItem()` nulls `source` and
+         *       `denormalizeLqipItem()` rebuilds it from the absolute url, so the file is named md5(absolute url) while `get()` hashes the URL as
+         *       found in the page and never finds it. Keep `source`.
+         */
         private function normalizeLqipItem(array $item): array {
             if (!isset($item['source']) || !isset($item['url'])) {
                 return $item;
@@ -144,6 +200,12 @@
         // Restores 'url'/'source' from 'lqipUrl' for items that went through normalizeLqipItem()
         // Needed because the persisted collection (cron state) can contain normalized items
         // that only carry 'lqipUrl', while generate()/filterWithProcessed() still read 'url'/'source' directly
+        /**
+         * Inverse of `normalizeLqipItem()`: sets missing `url` and missing/null `source` from `lqipUrl`.
+         *
+         * @param array $item
+         * @return array
+         */
         private function denormalizeLqipItem(array $item): array {
             if (!isset($item['url']) && isset($item['lqipUrl'])) {
                 $item['url'] = $item['lqipUrl'];
@@ -157,6 +219,12 @@
         }
 
 
+        /**
+         * Adds `timestamp` = time() to items that have none.
+         *
+         * @param array $collection
+         * @return array
+         */
         private function provideTimestamp(array $collection): array {
             $now = time();
             foreach ($collection as &$item) {
@@ -168,6 +236,13 @@
             return $collection;
         }
 
+        /**
+         * Drops queued items older than `$maxAgeSeconds` (default one day); items without `timestamp` are kept. Keys are preserved.
+         *
+         * @param array $collection
+         * @param int   $maxAgeSeconds
+         * @return array
+         */
         private function removeOldItemsFromCollection(array $collection, int $maxAgeSeconds = 86400): array {
             $threshold = time() - $maxAgeSeconds;
             return array_filter($collection, function($item) use ($threshold) {
@@ -175,6 +250,14 @@
             });
         }
 
+        /**
+         * Reads option `shortpixel_ai_lqip_state`, always returning `['collection' => array, 'processed' => array]`.
+         *
+         * When the option does not exist, it is created from the legacy `Options` keys `lqip.collection` (timestamps added) and
+         * `lqip.processed`, which are then deleted.
+         *
+         * @return array{collection: array, processed: array}
+         */
         private function getLqipState() {
             $state = get_option('shortpixel_ai_lqip_state', null);
 
@@ -201,6 +284,12 @@
             return $state;
         }
 
+        /**
+         * Writes option `shortpixel_ai_lqip_state` (autoloaded).
+         *
+         * @param array $state
+         * @return void
+         */
         private function saveLqipState($state) {
             update_option('shortpixel_ai_lqip_state', $state);
         }
@@ -210,6 +299,9 @@
 		/**
 		 * Single ton implementation
 		 *
+		 * The first call must pass the controller (`ShortPixelAI::setup_hooks()` does); a first call without one fails in the
+		 * constructor on `$this->ctrl->options`.
+		 *
 		 * @param \ShortPixelAI|false $controller
 		 *
 		 * @return \ShortPixel\AI\LQIP
@@ -218,6 +310,13 @@
 			return self::$instance instanceof self ? self::$instance : new self( $controller );
 		}
 
+		/**
+		 * Deletes option `shortpixel_ai_lqip_state`, every file and subdirectory of `self::DIR` and the directory itself, then the
+		 * legacy `lqip.processed` Options key. Used by the admin bar action and `wp shortpixel clear-lqips`.
+		 *
+		 * @return bool false when the directory does not exist (the state option is still deleted) or SPL iterators are missing;
+		 *              otherwise true when the directory was removed
+		 */
 		public static function clearCache() {
 		    SHORTPIXEL_AI_DEBUG && \ShortPixelAILogger::instance()->log('CLEARING CACHE in: ' . self::DIR);
 
@@ -260,9 +359,15 @@
 		/**
 		 * Method handles the received collection of URLs to fetch and create placeholders
 		 *
-		 * @param array $collectionFiltered
+		 * Keeps items whose file (md5 of `source`) is missing or expired. Nothing left: `['processed' => false, 'message' => 'Empty collection: ...']`.
+		 * `cron`: returns `schedule()`'s result. `instant`: `replaceWithParent()` then `generate()`, returning
+		 * `['processed' => <generate() result array|false>, 'message' => ...]`.
+		 *
+		 * @param array $collection Items `['url' => absolute URL, 'source' => page URL, 'referer' => URL|false]`
 		 *
 		 * @return array|bool
+		 * @todo In instant mode `process()` sets the message 'Could not instantly process' when `generate()` returned results, and ''
+		 *       when it failed; the condition is inverted (`empty( $ret )`).
 		 */
 		public function process( $collection ) {
             $this->log('PROCESSING LQIP REQUEST: ', $collection);
@@ -303,9 +408,12 @@
 		/**
 		 * Method returns placeholder's SVG content
 		 *
-		 * @param string $url
+		 * If `ShortPixelUrlTools::get_full_size_image_url()` finds a parent (full-size) image, the file name part of `$url` is replaced
+		 * by the parent's; the cached file `md5(<that url>).lqip.svg` is then read.
 		 *
-		 * @return false|string
+		 * @param string $url Image URL as found in the page
+		 *
+		 * @return false|string false when not cached
 		 */
 		public function get( $url ) {
             $parent = ShortPixelUrlTools::get_full_size_image_url($url);
@@ -323,12 +431,14 @@
 		/**
 		 * Method filters default WP cron intervals and adds new ones
 		 *
-		 * @param $schedules
+		 * Adds `every-minute` (interval 60 s, display "Every minute") unless already defined. Filter `cron_schedules`.
+		 *
+		 * @param array $schedules
 		 *
 		 * @return array
 		 */
 		public function cronSchedules( $schedules ) {
-			// Adds every 5 minutes to the existing schedules.
+			// Adds every minute to the existing schedules.
 			if ( empty( $schedules[ 'every-minute' ] ) ) {
 				$schedules[ 'every-minute' ] = [
 					'interval' => 60,
@@ -341,6 +451,12 @@
 
 		/**
 		 * Cron event handler
+		 *
+		 * Hooked on `spai_lqip_generate_event`. Drops queued items already processed with an existing file, takes the first
+		 * `BUNDLE_CAPACITY` (20), saves the rest back to the state, `generate()`s the bundle, then unschedules when the queue is
+		 * empty or ensures an `every-minute` schedule otherwise.
+		 *
+		 * @return void
 		 */
 		public function eventHandler() {
             $state = $this->getLqipState();
@@ -370,9 +486,13 @@
 		 * Method receives new collection from front pages, merges with current collection and set updated
 		 * Used for 'cron' process way
 		 *
+		 * Merge order: stored items (denormalized) then the new ones; adds timestamps, drops items older than a day,
+		 * `replaceWithParent()`, de-duplicates by `url` (last wins), normalizes, keeps items whose file is missing or expired,
+		 * saves the state, and reschedules on `every-minute` (or unschedules when empty).
+		 *
 		 * @param array $collection
 		 *
-		 * @return bool
+		 * @return array `['processed' => bool]` plus `message` when nothing was queued
 		 */
 		private function schedule( $collection ) {
 			if ( !empty( $collection ) && is_array( $collection ) ) {
@@ -419,9 +539,18 @@
 		/**
 		 * Method gets placeholders from the CDN and writes them into the files
 		 *
+		 * Per item: when a processed entry with the same `url` has `file === false` and `attempts >= ATTEMPTS_QTY`, no request is made
+		 * and `DEFAULT_PLACEHOLDER` is written (type `bip`); otherwise `Request::get( API_URL . '/' . url )`, and a placeholder body
+		 * (`isPlaceholder()`) is written as `md5(source).lqip.svg` (type `lqip`). Failures produce a result with `file` false and a message.
+		 * Items with a `referer` collect that page for `CacheCleaner::clear( '', <referers>, false )`. Results are merged into
+		 * `processed` (attempts counted by `countAttempts()`, de-duplicated by url) and saved.
+		 *
 		 * @param array $collection
 		 *
-		 * @return array|false
+		 * @return array|false Result entries, false when nothing was processed
+		 * @todo The first failure of a URL is stored with `attempts` null (`countAttempts()` only increments when a previous entry exists, and
+		 *       starts at 1 from a null), so `generate()` makes `ATTEMPTS_QTY + 1` (4) failed CDN requests before writing the blank placeholder.
+		 *       Start failures at 1.
 		 */
 		private function generate( $collection ) {
 			$return = [];
@@ -587,11 +716,18 @@
 		 * Method returns name of the recurrence (interval) of the specified event
 		 *
 		 * @return false|string
+		 * @todo `getScheduleRecurrence()` has no caller.
 		 */
 		private function getScheduleRecurrence() {
 			return wp_get_schedule( self::SCHEDULE[ 'name' ] );
 		}
 
+		/**
+		 * Clears and re-adds `spai_lqip_generate_event` with the given recurrence key (`regular` | `quick`).
+		 *
+		 * @param string $recurrence
+		 * @return void
+		 */
 		private function reschedule( $recurrence ) {
 			$this->removeSchedule();
 			$this->addSchedule( $recurrence );
@@ -599,6 +735,8 @@
 
 		/**
 		 * Method removes scheduled event
+		 *
+		 * @return void
 		 */
 		private function removeSchedule() {
 			if ( wp_next_scheduled( self::SCHEDULE[ 'name' ] ) ) {
@@ -609,7 +747,11 @@
 		/**
 		 * Method adds scheduled event
 		 *
+		 * Schedules `spai_lqip_generate_event` now when not scheduled. `$recurrence` is a key of `SCHEDULE['recurrence']`
+		 * (`quick` -> `every-minute`, `regular` -> `twicedaily`); unknown keys fall back to `regular`.
+		 *
 		 * @param string $recurrence
+		 * @return void
 		 */
 		private function addSchedule( $recurrence ) {
 			if ( !wp_next_scheduled( self::SCHEDULE[ 'name' ] ) ) {
@@ -621,7 +763,10 @@
 		}
 
 		/**
-		 * @param $collection
+		 * Points thumbnail items at their full-size image: when `get_full_size_image_url( url )` finds a parent, `url` becomes the
+		 * parent's absolute URL and the file name inside `source` is replaced by the parent's file name (so one LQIP serves all sizes).
+		 *
+		 * @param array $collection
 		 *
 		 * @return array
 		 */
@@ -656,11 +801,15 @@
 		 * Strangely, PHP doesn't have a mb_str_replace multibyte function
 		 * As we'll only ever use this function with UTF-8 characters, we can simply "hard-code" the character set
 		 *
-		 * @param $search
-		 * @param $replace
-		 * @param $subject
+		 * Falls back to `str_replace()` when mbstring is missing.
+		 *
+		 * @param string|string[] $search
+		 * @param string|string[] $replace
+		 * @param string|string[] $subject
 		 *
 		 * @return array|string
+		 * @todo For an array `$subject`, `mbStrReplace()` calls the undefined global function `mb_str_replace()` (fatal error); call `$this->mbStrReplace()`.
+		 *       No caller passes an array today.
 		 */
 		private function mbStrReplace( $search, $replace, $subject ) {
 			if ( !( function_exists( 'mb_substr' ) ) || !( function_exists( 'mb_strlen' ) ) || !( function_exists( 'mb_strpos' ) ) ) {
@@ -694,6 +843,8 @@
 		/**
 		 * Method filters the collection with URLs to be processed using already processed urls to decrease amount of requests
 		 *
+		 * An item is dropped when a processed entry has the same `source` and that entry's file exists. Keys are preserved.
+		 *
 		 * @param array $collection Collection of new URLs to be processed
 		 * @param array $processed  Collection of the already processed URLs
 		 *
@@ -724,6 +875,9 @@
 		/**
 		 * Method filters the collection to remove duplicates
 		 *
+		 * Duplicates are items with the same `url`; the last occurrence is kept and the result is re-indexed. Items lacking `url`
+		 * (normalized items carry `lqipUrl`) compare as null and collapse into one.
+		 *
 		 * @param array $collection Collection of new URLs to be processed
 		 *
 		 * @return array
@@ -750,6 +904,9 @@
 		 *
 		 * @param array $generated Nearly generated placeholders (after $this->generate() method)
 		 * @param array $processed Already processed placeholders
+		 *
+		 * For each failed item (`file === false`) with a processed entry of the same url: attempts = previous + 1, or 1 when the
+		 * previous value is not a positive int. Failures without a previous entry keep the value set by `generate()` (null).
 		 *
 		 * @return array
 		 */
@@ -797,6 +954,12 @@
 
 		/**
 		 * Method creates main necessary dir and index.html
+		 *
+		 * Runs on every construction. Old dir present and new absent: `rmove( OLD_DIR, DIR )` then `rmdir( dirname( OLD_DIR ) )`
+		 * (no `index.html` written). Else when `DIR` is missing: `mkdir` recursive 0755; failure sets transient `spai_lqip_mkdir_failed`
+		 * (12 h), success deletes it; then writes `DIR/index.html` (noindex).
+		 *
+		 * @return void
 		 */
 		private function createMainDir() {
 
@@ -822,8 +985,12 @@
         /**
          * Recursively move files from one directory to another
          *
+         * Subdirectories are moved recursively and removed; `$src` is removed at the end (errors suppressed).
+         *
          * @param String $src - Source of files being moved
          * @param String $dest - Destination of files being moved
+         * @return false|void false when `$src` is not a directory or `$dest` cannot be created
+         * @todo When `mkdir( $dest )` fails, `rmove()` tries to write `index.html` into the directory it just failed to create; drop that call.
          */
         private function rmove($src, $dest){
 
@@ -855,10 +1022,16 @@
 		/**
 		 * Method creates placeholder's file
 		 *
+		 * Writes only when the file is missing or expired, under `getPath( $name, true )`. The first `<svg ...>` tag gets
+		 * `data-u="%URL%" data-w="<width or %WIDTH%>" data-h="<height or %HEIGHT%>"` (dimensions from `getDimensions()`); for
+		 * `.lqip.svg` names the content then passes filter `shortpixel/ai/lqip/beforeSave` (string $content, string $name).
+		 * The same path is used for `index.html` (the `data-*` replacement does not match there).
+		 *
 		 * @param string $name
 		 * @param string $content
 		 *
 		 * @return bool
+		 * @todo `createFile()` does not check the `fopen()` result; a non-writable directory makes `fwrite()` throw a TypeError on PHP 8.
 		 */
 		private function createFile( $name, $content ) {
 			if ( empty( $name ) || empty( $content ) ) {
@@ -902,6 +1075,9 @@
 
 		/**
 		 * Method returns full path to the file
+		 *
+		 * `.lqip.svg` names whose base is at least `DIR_NAME_LENGTH` chars live in `DIR/<first 2 chars>/`; other names in `DIR/`.
+		 * With `$build_path` the subdirectory is created (0755) and chmod-ed; false is returned when that fails.
 		 *
 		 * @param string $name
 		 * @param bool   $build_path
@@ -982,6 +1158,9 @@
 		/**
 		 * Method writes messages into the log file
 		 *
+		 * Logs each argument through `var_export()` when `SHORTPIXEL_AI_DEBUG & ShortPixelAILogger::DEBUG_AREA_LQIP`
+		 * (that flag has the same value as `DEBUG_AREA_HTML`, so HTML debugging also enables LQIP logging).
+		 *
 		 * @param mixed $message The variable you want to export.
 		 * @param mixed $_       [optional]
 		 *
@@ -1007,6 +1186,10 @@
 
 		/**
 		 * Method triggers notices/warnings/errors
+		 *
+		 * Raises an `E_USER_NOTICE` when the mbstring functions are missing.
+		 *
+		 * @return void
 		 */
 		private function trigger() {
 			if ( !( function_exists( 'mb_substr' ) ) || !( function_exists( 'mb_strlen' ) ) || !( function_exists( 'mb_strpos' ) ) ) {
@@ -1016,6 +1199,9 @@
 
 		/**
 		 * LQIP constructor.
+		 *
+		 * Stores itself as the singleton, reads `behaviour.process_way` (validated, default `cron`), checks mbstring,
+		 * registers the hooks and creates/migrates the cache directory.
 		 *
 		 * @param \ShortPixelAI $controller
 		 */
@@ -1036,6 +1222,12 @@
 
 		/**
 		 * Setup Wordpress actions and filters
+		 *
+		 * Always: filter `cron_schedules` -> `cronSchedules()`, action `spai_lqip_generate_event` -> `eventHandler()`,
+		 * `wp_enqueue_scripts` -> `enqueueScripts()`. Instant mode only: `wp_ajax_shortpixel_ai_handle_lqip_action` and
+		 * `wp_ajax_nopriv_shortpixel_ai_handle_lqip_action` -> `LQIP\Actions::handle()`.
+		 *
+		 * @return void
 		 */
 		private function hooks() {
 			add_filter( 'cron_schedules', [ $this, 'cronSchedules' ] );
@@ -1054,6 +1246,12 @@
 
 		/**
 		 * Method used to enqueue front-end scripts
+		 *
+		 * Only with `behaviour.lqip` on and process way `instant`: registers `spai-lqip` (`assets/js/modules/lqip[.min].js`, footer,
+		 * depending on `spai-scripts` in jQuery mode) localized as `lqipConstants` = `{action: 'shortpixel_ai_handle_lqip_action',
+		 * ajax_url, processWay, localStorage: behaviour.local_storage, ajax_nonce: nonce 'shortpixel-ai-settings'}`, with the CSP nonce.
+		 *
+		 * @return void
 		 */
 		public function enqueueScripts() {
 			$scripts = [];

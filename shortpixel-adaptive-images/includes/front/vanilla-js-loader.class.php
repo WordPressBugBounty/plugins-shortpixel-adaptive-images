@@ -1,19 +1,75 @@
 <?php
 /**
- * Created by simon
- * Date: 19.01.2021
+ * Vanilla JS (default) front-end engine loader.
  */
 
 namespace ShortPixel\AI;
 
+/**
+ * Vanilla mode (`settings.behaviour.nojquery > 0`, default 2): the engine is the CDN bundle
+ * `https://<host>/assets/js/bundles/spai-lib-bg[-webp][-compat].<ver>[.dev].min.js?v=<plugin version>`, loaded async by an
+ * inline script printed on `wp_head`. The bundle is not part of this repository.
+ *
+ * Page markers: `html.spai_has_js` (added by the inline script), inline `<script id="spai_js" data-cfasync="false">`,
+ * `<style id="spai_bg_lazr">` (see `addTagData()`).
+ */
 class VanillaJsLoader extends JsLoader {
 
+    /**
+     * Only through `JsLoader::_()`.
+     */
     protected function __construct() {
         parent::__construct();
     }
 
+    /**
+     * Registers the inline loader script, the admin sniper helpers and the WP Rocket exclusions.
+     *
+     * `wp_head` closure prints `<script type="text/javascript" id="spai_js" data-cfasync="false">` which
+     * adds class ` spai_has_js` to `<html>`, sets `window.spaiDomain` (host of `get_cdn_url()`) and `window.spaiData`:
+     * - `version`: `SHORTPIXEL_AI_VERSION`;
+     * - `key`: last path segment of `get_cdn_url()` (e.g. `spai`);
+     * - `customKeys`: `{<behaviour.host_removal>: <last segment of choose_api_base()>}` when `amazon_s3` and both are set, else `[]`;
+     * - `quality`: `compression.level`;
+     * - `convert`: `none` (no webp/avif), `detect` (webp/avif on without `$varyCacheSupport`), `auto` (webp+avif), `webp` or `avif`;
+     * - `lqip`: bool `behaviour.lqip`;
+     * - `converts`: `{png, jpg, gif}` each `<convert>` or `none` per `<ext>_to_webp`; printed only when webp is on and at least one toggle is off;
+     * - `rootMargin`: `<behaviour.lazy_threshold>px` (500 when not an int >= 0);
+     * - `crop`: bool `behaviour.crop`;
+     * - `sizeBreakpoints`: `{on, base, rate}`;
+     * - `backgroundsMaxWidth`: `areas.backgrounds_max_width` (1920 when not an int >= 0);
+     * - `resizeStyleBackgrounds`: bool `areas.backgrounds_lazy_style`;
+     * - `nativeLazyLoad`: bool `behaviour.native_lazy`;
+     * - `safeLazyBackgrounds`: `backgrounds_lazy_style || backgrounds_lazy`;
+     * - `asyncInitialParsing`: `!behaviour.sync_initial_parsing`;
+     * - `debug`: bool `SHORTPIXEL_AI_DEBUG`;
+     * - `doSelectors`: placeholder `"__SPAI_DO_SELECTORS__"`, `exclusions`: placeholder `"__SPAI_EXCLUSIONS__"` (replaced by `addTagData()`);
+     * - `sizeFromImageSuffix`: false when `SPAI_FILENAME_RESOLUTION_UNSAFE` is defined;
+     * - `ajax_url`: admin-ajax URL.
+     * Bundle URL: host `dev.shortpixel.ai` and suffix `.dev` when debugging (`SHORTPIXEL_AI_DEBUG` or `?SPAI_VJS` present), else the CDN host;
+     * `-webp` when `convert === 'detect'`; `-compat` added client-side when `IntersectionObserver` is missing; version
+     * `?SPAI_VJS=<[.0-9a-zA-Z]+>` or `SHORTPIXEL_AI_VANILLAJS_VER`.
+     *
+     * For `manage_options` users: empty-source handle `spai-snip-action` (footer) localized as `spai_settings` with
+     * `api_domain`, `ajax_url`, `excluded_selectors`, `eager_selectors`, `noresize_selectors`, `excluded_paths`, `eager_paths`
+     * (paths base64-encoded) plus inline `spaiSniperClick()`, which defines a minimal `ShortPixelAI.is()` (NORESIZE 1, EXCLUDED 2,
+     * EAGER 4) and calls `SpaiSniper(1)`.
+     * With WP Rocket active: `rocket_defer_inline_exclusions` -> `wp_rocket_no_defer_spai_settings()`, `rocket_delay_js_exclusions`
+     * -> `wp_rocket_no_defer_spai_lib()`. Then `parent::enqueue()`.
+     *
+     * @return void
+     * @todo `?SPAI_VJS` in `VanillaJsLoader::enqueue()` switches any visitor (no capability check) to the `dev.shortpixel.ai` host and an
+     *       arbitrary bundle version, and a page cache can then serve that page to everyone. Honour it only for `manage_options` users or when `SHORTPIXEL_AI_DEBUG` is set.
+     * @todo `converts` is printed only when WebP is on; with AVIF alone the per-extension `<ext>_to_webp` toggles are ignored by the bundle while
+     *       `get_api_url()` honours them. Use `$convert !== 'none'` as the condition.
+     * @todo The inline `#spai_js` script gets no CSP nonce (`spai_script_nonce` is applied only to registered handles).
+     */
     public function enqueue()
     {
+        /**
+         * Prints the inline `#spai_js` loader script (see the method docblock for `window.spaiData`).
+         * @return void
+         */
         add_action( 'wp_head', function() {
             $apiUrlParts = explode('/', rtrim($this->ctrl->get_cdn_url(), '/'));
             $customApiUrlParts = explode('/', rtrim($this->ctrl->choose_api_base(), '/'));
@@ -152,12 +208,24 @@ class VanillaJsLoader extends JsLoader {
         parent::enqueue();
     }
 
+    /**
+     * Filter `rocket_delay_js_exclusions`: keeps `spai_js` out of WP Rocket's "delay JS".
+     *
+     * @param string[] $regex
+     * @return string[]
+     */
     public function wp_rocket_no_defer_spai_lib($regex) {
         $regex[] = 'spai_js';
         $this->logger->log("WP ROCKET rocket_delay_js_exclusions: ");
         return $regex;
     }
 
+    /**
+     * Filter `rocket_defer_inline_exclusions`: keeps the inline `spai_js` script out of WP Rocket's inline deferral.
+     *
+     * @param string|string[] $regex Regex string (`|`-joined) or list
+     * @return string|string[]
+     */
     public function wp_rocket_no_defer_spai_settings($regex) {
         if( is_string( $regex ) ){
             $this->logger->log("WP ROCKET ADDED SPAI as string");
@@ -168,6 +236,19 @@ class VanillaJsLoader extends JsLoader {
         return $regex;
     }
 
+    /**
+     * Fills the `spaiData` placeholders and adds the background-hiding style.
+     *
+     * When `"__SPAI_DO_SELECTORS__"` (with quotes) is present, it is replaced by `json_encode( getDoSelectors() )` and
+     * `"__SPAI_EXCLUSIONS__"` by `getExclusions()`. Otherwise (inline script moved to a file by WP Rocket or similar) it inserts
+     * `<script id="spai_js">var spai_doSelectors=<json>;var spai_exclusions=<json>;</script>` before `</body>`.
+     * Then, before `</head>`, `<style id="spai_bg_lazr"><selector>{background-image: none !important;}</style>` with selector
+     * `html.spai_has_js :not([data-spai-bg-prepared])` when a `__stylesheet` do-selector exists, else
+     * `html.spai_has_js [data-spai-bg-on]:not([data-spai-bg-prepared])` when `areas.backgrounds_lazy`; no style otherwise.
+     *
+     * @param string $content
+     * @return string
+     */
     public function addTagData($content)
     {
         //$affectedTags = $this->ctrl->affectedTags->getAll();
@@ -206,6 +287,22 @@ class VanillaJsLoader extends JsLoader {
         return $content;
     }
 
+    /**
+     * Builds `spaiData.doSelectors`: the list of element groups the bundle must process.
+     *
+     * Items, in order:
+     * - when AffectedTags has `SRC_ATTR` entries, for each `TagRules::usedLazy()` rule of type `url`:
+     *   `{selectors: "<used tags joined by ,>", type: "attr", targetAttr: <attr>, attrType: "json"|"url" (json for
+     *   `replace_custom_json_attr`), lazy: !frontEager, resize: frontResize}`;
+     * - when AffectedTags has `CSS_ATTR` entries and `areas.backgrounds_lazy`:
+     *   `{selectors: "[data-spai-bg-on]", type: "attr", targetAttr: "style", attrType: "style"}`;
+     * - for each `TagRules::frontEndItems()` rule: `{selectors: <tag>, type: "attr", targetAttr: <attr>, attrType: "url", lazy, resize}`
+     *   plus `filter: {attrName, attrValue}` when the rule has `attrFilter`;
+     * - `areas.backgrounds_lazy_style`: `{selectors: "style", type: "inner", attrType: "style"}`;
+     * - `backgrounds_lazy_style` and `parse_css_files > 0`: `{type: "__stylesheet"}`.
+     *
+     * @return array[]
+     */
     protected function getDoSelectors() {
         //$lazyRules = TagRules::_()->usedLazy();
         (SHORTPIXEL_AI_DEBUG & \ShortPixelAILogger::DEBUG_AREA_CSS) && $this->logger->log("AFFECTED TAGS: ", $this->ctrl->affectedTags->getAll());
@@ -265,6 +362,17 @@ class VanillaJsLoader extends JsLoader {
         return $doSelectors;
     }
 
+    /**
+     * Builds `spaiData.exclusions` as a JSON string `{"selectors": {<sel>: props}, "urls": {<rule>: props}}`.
+     *
+     * Each entry starts from `{lazy: 1, cdn: 1, resize: 1, lqip: 0, crop: 0}` and is overridden by, in order:
+     * `excluded_paths` lines -> urls `{lazy: 0, cdn: 0, resize: 0, crop: -1}`; `eager_paths` lines -> urls `{lazy: 0}`;
+     * `excluded_selectors` -> selectors `{lazy: 0, cdn: 0, resize: 0, crop: -1}`; `noresize_selectors` (+ Modula
+     * `.modula-creative-gallery img.pic`, WooCommerce `img.zoomImg`) -> `{resize: 0, crop: -1}`; `eager_selectors`
+     * (+ Modula) -> `{lazy: 0}`. URL keys are the raw rule lines (`regex:...`, `path:...`, `domain:...`). Empty lists encode as `[]`.
+     *
+     * @return string JSON
+     */
     protected function getExclusions() {
         //"div.excluded-lazy-lqip" : { lazy: 1, cdn:0, resize:0, lqip: 0, crop:-1},
         $exclusions = ['selectors' => [], 'urls' => []];
@@ -304,6 +412,15 @@ class VanillaJsLoader extends JsLoader {
         return json_encode($exclusions);
     }
 
+    /**
+     * Creates `$exclusion[$type][$key]` with the defaults `{lazy: 1, cdn: 1, resize: 1, lqip: 0, crop: 0}` when missing, then merges `$props`.
+     *
+     * @param array  $exclusion Exclusions array, modified by reference
+     * @param string $type      `selectors` or `urls`
+     * @param string $key       Selector or URL rule
+     * @param array  $props     Properties to override
+     * @return void
+     */
     protected function alterExclusion(&$exclusion, $type, $key, $props) {
         if(!isset($exclusion[$type][$key])) {
             $exclusion[$type][$key] =  ['lazy' => 1, 'cdn' => 1, 'resize' => 1, 'lqip' => 0, 'crop' => 0];
@@ -311,11 +428,22 @@ class VanillaJsLoader extends JsLoader {
         $exclusion[$type][$key] = array_merge($exclusion[$type][$key], $props);
     }
 
+    /**
+     * True when the buffered page contains `/assets/js/bundles/spai-lib-bg` (the inline loader's bundle URL).
+     *
+     * @param string $content Buffered HTML
+     * @return bool
+     */
     public function check($content)
     {
         return strpos($content, '/assets/js/bundles/spai-lib-bg') !== false;
     }
 
+    /**
+     * No-op in vanilla mode (the former inline style is commented out).
+     *
+     * @return void
+     */
     public function fadeInCss()
     {
         /*

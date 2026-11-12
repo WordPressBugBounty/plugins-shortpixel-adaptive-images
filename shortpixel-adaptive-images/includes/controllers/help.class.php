@@ -2,17 +2,39 @@
 
 	namespace ShortPixel\AI;
 
+	/**
+	 * Contextual "Help" tabs on the plugin's admin screens and the help AJAX hook.
+	 *
+	 * Adds a "Help & Support" tab and, while `pages.on_boarding.display_allowed` is truthy, a "Setup Wizard" tab whose
+	 * `[data-action="enable on boarding"][data-plugin="shortpixel-adaptive-images"]` button is handled by `admin.js`,
+	 * which posts `action=shortpixel_ai_handle_help_action`, `data[action]=enable on boarding` (no nonce) to
+	 * `Help\Actions::handle()`.
+	 *
+	 * @todo `_()` never stores the instance (the constructor does not set `self::$instance`), so every call builds a
+	 *       new object and registers the hooks again. Set `self::$instance = $this` in the constructor.
+	 */
 	class Help {
 		/**
-		 * Instance of the class (singleton)
-		 * @var \ShortPixel\AI\Help $instance
+		 * Instance of the class (singleton); never assigned (see the class `@todo`).
+		 * @var \ShortPixel\AI\Help|null $instance
 		 */
 		private static $instance;
 
+		/**
+		 * Returns the instance; currently always a new one that registers its hooks.
+		 *
+		 * @return \ShortPixel\AI\Help
+		 */
 		public static function _() {
 			return self::$instance instanceof self ? self::$instance : new self;
 		}
 
+		/**
+		 * `current_screen` callback (priority 50): on allowed screens (see `getScreens()`) adds the support tab, the
+		 * wizard tab when `pages.on_boarding.display_allowed` is truthy, and a sidebar with documentation/support links.
+		 *
+		 * @return void
+		 */
 		public function addTabs() {
 			$screen = get_current_screen();
 
@@ -34,17 +56,29 @@
 		}
 
 		/**
-		 * Help real constructor.
+		 * Help real constructor: registers the hooks.
 		 */
 		private function __construct() {
 			$this->hooks();
 		}
 
+		/**
+		 * Hooks `addTabs` on `current_screen` (50) and `Help\Actions::handle` on `wp_ajax_shortpixel_ai_handle_help_action`.
+		 *
+		 * @return void
+		 */
 		private function hooks() {
 			add_action( 'current_screen', [ $this, 'addTabs' ], 50 );
 			add_action( 'wp_ajax_shortpixel_ai_handle_help_action', [ 'ShortPixel\AI\Help\Actions', 'handle' ] );
 		}
 
+		/**
+		 * Returns a help tab definition for `WP_Screen::add_help_tab()`.
+		 *
+		 * @param string $id `support` or `on-boarding`.
+		 *
+		 * @return array{id?: string, title?: string, content?: string} Empty array for an unknown id.
+		 */
 		private function getTab( $id ) {
 			switch ( $id ) {
 				case 'support':
@@ -72,20 +106,35 @@
 			return [];
 		}
 
+		/**
+		 * Tells whether the screen id contains one of the slugs from `getScreens()`.
+		 *
+		 * @param \WP_Screen $screen
+		 *
+		 * @return bool
+		 */
 		private function isAllowedScreen( $screen ) {
 			$screens = $this->getScreens();
 
+			// Closure: true when the screen id contains the page slug `$id`.
 			return !empty( array_filter( $screens, function( $id ) use ( $screen ) {
 				return strpos( $screen->id, $id ) !== false;
 			} ) );
 		}
 
+		/**
+		 * Returns the page slugs from `Page::NAMES` that get help tabs: all except the keys in
+		 * `apply_filters( 'shortpixel/ai/help/disallowedPages', [ 'on-boarding' ] )`.
+		 *
+		 * @return string[]
+		 */
 		private function getScreens() {
 			$current_pages    = Page::NAMES;
 			$disallowed_pages = [ 'on-boarding' ];
 
 			$disallowed_pages = apply_filters( 'shortpixel/ai/help/disallowedPages', $disallowed_pages );
 
+			// Closure: keeps the `Page::NAMES` entries whose key is not in `$disallowed_pages`.
 			return array_values( array_filter( $current_pages, function( $page_key ) use ( $disallowed_pages ) {
 				return !in_array( $page_key, $disallowed_pages );
 			}, ARRAY_FILTER_USE_KEY ) );

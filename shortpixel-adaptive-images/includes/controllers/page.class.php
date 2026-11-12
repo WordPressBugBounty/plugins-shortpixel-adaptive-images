@@ -7,16 +7,50 @@
 	use ShortPixel\AI\Options\Category;
 	use ShortPixel\AI\Options\Collection;
 
+	/**
+	 * Admin pages of the plugin: menus, assets, templates, export/import, on-boarding redirect, nonce helpers.
+	 *
+	 * Instantiated (singleton) by `ShortPixelAI` in the back-end branch and in admin AJAX requests whose `action`
+	 * starts with `shortpixel_ai` and that carry `data`.
+	 *
+	 * Pages (`NAMES`, all require `manage_options`):
+	 * - `options-general.php?page=shortpixel-ai-settings`: settings page, renders `settings.tpl.php`.
+	 * - `admin.php?page=shortpixel-ai-on-boarding`: wizard, hidden (parent `admin.php`), renders `on-boarding.tpl.php`.
+	 * - `admin.php?page=shortpixel-ai-export-settings`: hidden; called by `settings.js` with `spainonce` and
+	 *   `noheader=true`; sends `settings.*` as `SPAI-settings.json` (`Category::exportRecursive()`) and dies.
+	 * - `admin.php?page=shortpixel-ai-import-settings`: hidden; target of `#import_settings_form` (file field
+	 *   `import_settings_file`, hidden `spainonce`); JSON-decodes the upload and stores every
+	 *   `{ area: { name: value } }` pair as `settings.<area>.<name>` with `Options::set()`, then shows a notice and
+	 *   redirects to the settings page after 5 s with JS.
+	 *
+	 * Hooks (`hooks()`): `init` -> `globalInit`, `admin_footer` -> `adminFooter` (Chatbase embed),
+	 * `admin_init` -> `adminInit` (plugin data + wizard redirect), `admin_menu` -> `initAdminPages`,
+	 * `admin_bar_menu` (500) -> `initAdminBarItems`, `admin_enqueue_scripts` -> `enqueueAdminScripts`,
+	 * `wp_ajax_shortpixel_ai_handle_page_action` -> `Page\Actions::handle`, and on the front end
+	 * `wp_enqueue_scripts` -> `enqueueScripts`.
+	 *
+	 * Nonce: action `shortpixel-ai-settings`, request field `spainonce` (`getNonce()`, `checkSpaiNonce()`). The
+	 * templates print it in `data-spainonce` attributes and hidden `spainonce` inputs.
+	 *
+	 * @todo The import page callback (in `initAdminPages()`) stores any area and setting name from the uploaded
+	 *       JSON without a whitelist or sanitising (values containing `<` are NOT dropped here, unlike the AJAX
+	 *       save), and it checks the upload only with `file_exists()` (no `is_uploaded_file()`, size or type check).
+	 *       Restrict areas/names to the known option paths and run values through the same sanitising as
+	 *       `Page\Actions::handle()`.
+	 * @todo On a bad nonce the import page (in `initAdminPages()`) calls `checkSpaiNonce()` after the admin header
+	 *       has been printed, so `wp_send_json()` emits JSON inside the HTML page (with "headers already sent"
+	 *       warnings). Check the nonce on `load-admin_page_shortpixel-ai-import-settings` or print a notice instead.
+	 */
 	class Page {
 		/**
-		 * View folder
+		 * Absolute directory of the `*.tpl.php` templates rendered by `render()`.
 		 * @var string
 		 */
 		const VIEWS_DIR = SHORTPIXEL_AI_PLUGIN_DIR . '/includes/views';
 
 		/**
-		 * Available page names
-		 * @var array
+		 * Internal page key => admin page slug (`?page=` value). Keys are the values accepted by `isCurrent()`.
+		 * @var array<string, string>
 		 */
 		const NAMES = [
 			'settings'    => 'shortpixel-ai-settings',
@@ -26,7 +60,7 @@
 		];
 
 		/**
-		 * @var \ShortPixel\AI\Page $instance
+		 * @var \ShortPixel\AI\Page $instance The singleton, set by the first constructor call.
 		 */
 		private static $instance;
 
@@ -36,32 +70,41 @@
 		protected $ctrl;
 
 		/**
-		 * @var array $data AI plugin data
+		 * @var array $data Plugin header data from `get_plugin_data()`, filled in `adminInit()`; templates read it.
 		 */
 		protected $data;
 
         /**
-         * @var string $nonce SPAI plugin nonce
+         * @var string|false $nonce Cached `shortpixel-ai-settings` nonce; false until `getNonce()` creates it.
          */
         protected $nonce = false;
 
 		/**
-		 * @var Collection|Category|Option
+		 * @var Collection|Category|Option Never assigned in this class; templates use `$this->ctrl->options`.
 		 */
 		protected $options;
 
 		/**
-		 * @var \ShortPixel\AI\Notice\Constants
+		 * @var \ShortPixel\AI\Notice\Constants Notice texts/causers, used by the templates.
 		 */
 		protected $noticeConstants;
 
+		/**
+		 * @var object|false $domain_status Result of `ShortPixelDomainTools::get_domain_status( true )`, set in
+		 *                                  `enqueueAdminScripts()` on the settings page; read by `settings.tpl.php`.
+		 */
 		protected $domain_status = false;
+
+		/**
+		 * @var object|false|null $domain_usage Result of `ShortPixelDomainTools::get_cdn_domain_usage()` (false when no
+		 *                                      API key), set in `enqueueAdminScripts()` on the settings page.
+		 */
 		protected $domain_usage;
 
 		/**
-		 * Single ton implementation
+		 * Returns the singleton, creating it (and registering the hooks) on first call.
 		 *
-		 * @param \ShortPixelAI $controller
+		 * @param \ShortPixelAI $controller Main plugin controller; ignored once the instance exists.
 		 *
 		 * @return \ShortPixel\AI\Page
 		 */
@@ -70,9 +113,12 @@
 		}
 
 		/**
-		 * Method verifies does specified page is user's current page
+		 * Tells whether the current admin screen is one of the plugin pages.
 		 *
-		 * @param string $page
+		 * Matches with `strpos( $screen->id, NAMES[ $page ] )`, so any screen id containing the slug matches.
+		 * Returns false for unknown keys and before `get_current_screen()` exists (front end, early admin hooks).
+		 *
+		 * @param string $page Key of `NAMES` (`settings`, `on-boarding`, `export-settings`, `import-settings`).
 		 *
 		 * @return bool
 		 */
@@ -86,6 +132,14 @@
 			return $screen && strpos( $screen->id, self::NAMES[ $page ] ) !== false;
 		}
 
+        /**
+         * Returns the settings nonce (action `shortpixel-ai-settings`), created once per request and cached.
+         *
+         * Printed by the templates as `data-spainonce` / hidden `spainonce`, and by the admin-bar CSS/CDN cache
+         * buttons in `ShortPixelAI`.
+         *
+         * @return string
+         */
         public function getNonce() {
             if($this->nonce === false) {
                 $this->nonce = wp_create_nonce('shortpixel-ai-settings');
@@ -93,6 +147,14 @@
             return $this->nonce;
         }
 
+        /**
+         * Verifies `$_REQUEST['spainonce']` against action `shortpixel-ai-settings`.
+         *
+         * On failure it ends the request with `wp_send_json( [ 'success' => false, 'message' => 'Invalid or expired
+         * nonce. ...' ] )`; it never returns false. It does not check capabilities.
+         *
+         * @return true
+         */
         public static function checkSpaiNonce() {
             if(!isset($_REQUEST['spainonce']) || !wp_verify_nonce($_REQUEST['spainonce'], 'shortpixel-ai-settings')) {
                 wp_send_json( [ 'success' => false, 'message' => __( 'Invalid or expired nonce. Please retry the action.', 'shortpixel-adaptive-images' ) ] );
@@ -101,14 +163,18 @@
         }
 
 		/**
-		 * Global init
+		 * `init` callback. Empty.
+		 *
+		 * @return void
 		 */
 		public function globalInit() {
 			// add things here :)
 		}
 
 		/**
-		 * Admin init
+		 * `admin_init` callback: loads the plugin header data into `$data` and runs `checkForWizardRedirect()`.
+		 *
+		 * @return void
 		 */
 		public function adminInit() {
 			$this->data = get_plugin_data( SHORTPIXEL_AI_PLUGIN_FILE );
@@ -117,7 +183,14 @@
 		}
 
 		/**
-		 * Admin footer
+		 * `admin_footer` callback: prints the Chatbase chatbot embed on the settings and on-boarding screens.
+		 *
+		 * The inline script installs a queueing `window.chatbase` proxy (unless already initialised) and, on window
+		 * `load`, appends `https://www.chatbase.co/embed.min.js` with id `M__c7Yk58ZL23gk7UIWY-` (the bot id) and
+		 * `domain` `www.chatbase.co`. The inline script carries no CSP nonce. The beacon div for the settings page
+		 * is commented out.
+		 *
+		 * @return void
 		 */
 		public function adminFooter() {
 			if ( self::isCurrent( 'settings' ) ) {
@@ -165,7 +238,12 @@
 		}
 
 		/**
-		 * Front-end styles & scripts for pages
+		 * `wp_enqueue_scripts` callback (front end only): enqueues `assets/css/admin(.min).css` as
+		 * `spai-admin-styles` for `manage_options` users (styles the admin-bar items).
+		 *
+		 * The version is the file's CRC32 when `SHORTPIXEL_AI_DEBUG` is set, else `SHORTPIXEL_AI_VERSION`.
+		 *
+		 * @return void
 		 */
 		public function enqueueScripts() {
 			$min    = ( !!SHORTPIXEL_AI_DEBUG ? '' : '.min' );
@@ -181,7 +259,18 @@
 		}
 
 		/**
-		 * Admin styles & scripts for pages
+		 * `admin_enqueue_scripts` callback.
+		 *
+		 * Settings page: fetches domain usage (remote, only with an API key) and domain status (remote, refreshed)
+		 * into `$domain_usage`/`$domain_status`; registers `chart.js` and enqueues `spai-settings`
+		 * (`pages/settings`) with `exclusionsL10n` strings, the CSP nonce (`ShortPixelUrlTools::applyNonce`) and,
+		 * when the domain has an account and usage quota, the `statusBox` chart data. A pending
+		 * `spaiModeSwitchNotification` transient is passed as `window.spaiModeSwitchNotification` (only `"` is
+		 * escaped) and deleted. The current user's name pieces are computed but not used.
+		 *
+		 * On-boarding page: registers `spai-js-cookie` (`libs/js.cookie`) and `spai-on-boarding`.
+		 *
+		 * @return void
 		 */
 		public function enqueueAdminScripts() {
 			$min     = ( !!SHORTPIXEL_AI_DEBUG ? '' : '.min' );
@@ -249,7 +338,14 @@
 		}
 
 		/**
-		 * Admin menu pages hook
+		 * `admin_menu` callback: registers the four pages listed in the class docblock (`manage_options`).
+		 *
+		 * The export and import pages are hidden submenus of `admin.php` with a null menu title; their callbacks
+		 * are closures. Export: `checkSpaiNonce()`, JSON download of `settings.*`, `die()`. Import: see class
+		 * docblock; ends with `wp_die()`. Nothing is printed when the nonce is valid but no file was uploaded or
+		 * the file is not valid JSON.
+		 *
+		 * @return void
 		 */
 		public function initAdminPages() {
 			add_submenu_page(
@@ -258,6 +354,10 @@
 				'ShortPixel AI On-Boarding',
 				'manage_options',
 				self::NAMES[ 'on-boarding' ],
+				/**
+				 * Renders the on-boarding wizard template.
+				 * @return void
+				 */
 				function() {
 					$this->render( 'on-boarding.tpl.php' );
 				} );
@@ -268,6 +368,10 @@
 				'ShortPixel AI',
 				'manage_options',
 				self::NAMES[ 'settings' ],
+				/**
+				 * Renders the settings template.
+				 * @return void
+				 */
 				function() {
 					$this->render( 'settings.tpl.php' );
 				} );
@@ -278,6 +382,10 @@
                 null,
                 'manage_options',
                 self::NAMES[ 'export-settings' ],
+                /**
+                 * Checks the nonce and sends `settings.*` as the `SPAI-settings.json` download, then dies.
+                 * @return void
+                 */
                 function() {
                     Page::checkSpaiNonce();
                     header('Content-Type: application/json');
@@ -292,6 +400,10 @@
                 null,
                 'manage_options',
                 self::NAMES[ 'import-settings' ],
+                /**
+                 * Checks the nonce, imports the uploaded JSON into `settings.*` (see class docblock), then `wp_die()`.
+                 * @return void
+                 */
                 function() {
                     echo('<h1>' . esc_html( get_admin_page_title() ) . '</h1>');
                     if(self::checkSpaiNonce() && isset($_FILES['import_settings_file']) && file_exists($_FILES['import_settings_file'] ["tmp_name"]))
@@ -328,7 +440,13 @@
         }
 
 		/**
+		 * `admin_bar_menu` callback: adds a "ShortPixel AI Setup" node linking to the wizard while the wizard is
+		 * allowed (`pages.on_boarding.display_allowed`) and not passed (`has_been_passed`), only in wp-admin and only
+		 * for `manage_options` users.
+		 *
 		 * @param \WP_Admin_Bar $admin_bar
+		 *
+		 * @return void
 		 */
 		public function initAdminBarItems( $admin_bar ) {
 			if ( !!$this->ctrl->options->pages_onBoarding_displayAllowed && !$this->ctrl->options->pages_onBoarding_hasBeenPassed ) {
@@ -346,6 +464,15 @@
 			}
 		}
 
+		/**
+		 * Includes a template from `VIEWS_DIR` inside `<div class="wrap">`. The template runs in this method's scope,
+		 * so `$this` is the Page instance. Uses `require_once`, so a view renders at most once per request. Prints
+		 * nothing when the file does not exist.
+		 *
+		 * @param string $view Template file name, e.g. `settings.tpl.php`.
+		 *
+		 * @return void
+		 */
 		public function render( $view ) {
 			if ( file_exists( self::VIEWS_DIR . DIRECTORY_SEPARATOR . $view ) ) {
 				echo '<div class="wrap">';
@@ -355,7 +482,7 @@
 		}
 
 		/**
-		 * Page constructor.
+		 * Stores the singleton (if none yet), the controller and the notice constants, and registers the hooks.
 		 *
 		 * @param \ShortPixelAI $controller
 		 */
@@ -372,7 +499,9 @@
 		}
 
 		/**
-		 * Method adds hooks
+		 * Registers the WordPress hooks listed in the class docblock.
+		 *
+		 * @return void
 		 */
 		private function hooks() {
 			add_action( 'init', [ $this, 'globalInit' ] );
@@ -388,6 +517,24 @@
 			}
 		}
 
+		/**
+		 * Redirects once to the on-boarding wizard after the first activation.
+		 *
+		 * Runs on every `admin_init`. When `pages.on_boarding.redirect_allowed` is anything but `false` (activation
+		 * sets it to `true`; a missing value reads as null and also passes) it is set to `false` (one shot), and the
+		 * redirect happens only if ALL of these hold: `flags.all.first_install` is truthy,
+		 * `pages.on_boarding.display_allowed` is falsy, `pages.on_boarding.step` is empty and
+		 * `pages.on_boarding.has_been_passed` is falsy. Then `first_install` becomes false, `display_allowed` true,
+		 * and it calls `wp_redirect( admin.php?page=shortpixel-ai-on-boarding )` + `die`.
+		 *
+		 * @todo `checkForWizardRedirect()` checks neither the user's capability, nor `wp_doing_ajax()`, nor bulk or
+		 *       network activation, so the one-shot redirect can be consumed by an admin-ajax request (which then
+		 *       answers with a redirect) or by a user without `manage_options` (who lands on a page they cannot
+		 *       open). Skip when `wp_doing_ajax()`, `isset( $_GET['activate-multi'] )`, `is_network_admin()` or
+		 *       `!current_user_can( 'manage_options' )`, without consuming the flag.
+		 *
+		 * @return void
+		 */
 		private function checkForWizardRedirect() {
 			if ( $this->ctrl->options->pages_onBoarding_redirectAllowed !== false) {
 				$this->ctrl->options->set( false, 'redirect_allowed', [ 'pages', 'on_boarding' ] );

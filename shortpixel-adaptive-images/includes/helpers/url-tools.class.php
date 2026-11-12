@@ -1,27 +1,125 @@
 <?php
+/**
+ * Static URL, path, image-size and placeholder helpers shared by the parsers and the controller.
+ *
+ * @package ShortPixel\AI
+ */
 
 use \ShortPixel\AI\LQIP;
 use \ShortPixel\AI\Options;
 
+/**
+ * URL helpers: validation, absolutisation, file-system lookup of image sizes, SVG
+ * placeholders, CSP nonces.
+ *
+ * All methods are static. State: `$SIZE_CACHE` (private static) memoises
+ * {@see get_image_size()} per URL for the whole request; tests must reset it through reflection
+ * (`ShortPixelUrlTools::$SIZE_CACHE = []`). Several methods also touch singletons:
+ * `isValid()` calls `ShortPixelAI::_()` (creating the controller if needed) for CSS/JS/font
+ * URLs; `generate_placeholder_svg()` reads `Options::_()`, `LQIP::_()` and writes
+ * `ShortPixelAI::_()->blankInlinePlaceholders`; `get_image_size()` reads `Options::_()`.
+ *
+ * The CDN URL grammar itself is built by ShortPixelAI::get_api_url(); this class only decides
+ * which URLs qualify and supplies the placeholder that lazy elements carry instead.
+ */
 class ShortPixelUrlTools {
+    /**
+     * Base64 of a 1x1 transparent GIF. Only referenced by the commented-out GIF placeholder code.
+     * @var string
+     */
     const PX_ENCODED = 'R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
+    /**
+     * Base64 of `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1" width="1" height="1" data-bip=""></svg>`:
+     * the placeholder {@see generate_placeholder_svg()} returns when width, height and URL are all empty.
+     * @var string
+     */
     const PX_SVG_ENCODED = 'PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxIDEiIHdpZHRoPSIxIiBoZWlnaHQ9IjEiIGRhdGEtYmlwPSIiPjwvc3ZnPg==';
+    /**
+     * Old placeholder template without the URL. Only referenced by commented-out code.
+     * @var string
+     */
     const PX_SVG_TPL = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %WIDTH% %HEIGHT%" width="%WIDTH%" height="%HEIGHT%" data-bip=""></svg>';
 
     /* New constants */
+    /**
+     * Placeholder template: `%WIDTH%`, `%HEIGHT%` and `%URL%` (urlencoded original URL) are
+     * substituted by {@see generate_placeholder_svg()}. `data-u` is what the front-end JS and
+     * {@see url_from_placeholder_svg()} read back; `data-bip` marks a blank inline placeholder.
+     * @var string
+     */
     const PX_SVG_TEMPLATE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %WIDTH% %HEIGHT%" width="%WIDTH%" height="%HEIGHT%" data-u="%URL%" data-w="%WIDTH%" data-h="%HEIGHT%" data-bip=""></svg>';
 
+    /**
+     * Extensions (lower case, no dot) the CDN can serve: raster/vector images and PDF, CSS/JS,
+     * fonts. {@see isValid()} accepts any other URL only if its extension is listed here
+     * (css/js/woff/woff2/ttf have extra host rules there); `ShortPixelJsonParser::replaceUrl()`
+     * also filters on it.
+     * Example: `in_array('jfif', ShortPixelUrlTools::$PROCESSABLE_EXTENSIONS)` is true, `'heic'` is false.
+     * @var string[]
+     */
     public static $PROCESSABLE_EXTENSIONS = [
         'jpg', 'jpeg', 'jpe', 'jfif', 'gif', 'png', 'pdf', 'svg', 'webp', 'avif', 'bmp', 'tiff',
         'css', 'js',
         'eot', 'woff', 'woff2', 'ttf', 'otf' ];
+    /**
+     * Types the CDN only stores and serves as is: ShortPixelAI::get_api_url() emits no `w_`,
+     * `q_`, `ex_1` or `to_*` token for them (only `ret_*`, `p_h`, `v_N`). Note `css` is not
+     * listed (it gets `q_`) while `js` is.
+     * Example: for `a.woff2` the URL is `<base>/ret_img/<origin>`.
+     * @var string[]
+     */
     public static $ONLY_STORE = [ 'svg', 'js', 'eot', 'webp', 'avif', 'woff', 'woff2', 'ttf', 'otf' ];
+    /**
+     * Types that `ShortPixelRegexParser::_replace_images()` requests with `ret_auto` and the CSS
+     * cache version `v_N` when eager (CDN waits for the processed file instead of redirecting,
+     * avoiding CORS problems).
+     * Example: an eager `<link href="a.css">` gets `.../ret_auto+v_3/...` (other tokens omitted).
+     * @var string[]
+     */
     public static $EAGER_WAIT = [ 'css', 'js', 'woff2', 'woff', 'otf', 'ttf', 'eot' ];
+    /**
+     * @var array<string,array> Request-wide memo of {@see get_image_size()} results keyed by the
+     *                          URL as passed. Reset it between tests.
+     */
     private static $SIZE_CACHE = [];
 
+    /**
+     * Decides whether a URL may be sent to the CDN.
+     *
+     * Input grammar: absolute (`https://h/p`), protocol-relative (`//h/p`) or relative (`/p`, `p`)
+     * URL, possibly HTML-entity-encoded and wrapped in whitespace, NBSP bytes or quotes.
+     *
+     * Steps:
+     * 1. Entity-decode, then trim spaces, `\0`, `\x0B`, the bytes `\xC2`/`\xA0` and `'`/`"`.
+     * 2. Empty: false. Contains `<`, `>`, `"`, `'` or a backtick: false (attribute break-out guard).
+     * 3. Rebuild with each path segment `urlencode()`d (so UTF-8 paths validate) and check with
+     *    `FILTER_VALIDATE_URL`; relative URLs are checked as `http://www.example.com/<url>`.
+     *    The query/fragment are re-attached by offset, assuming the rebuilt prefix has the
+     *    original length (ports and encoded chars shift it; the check usually still passes).
+     * 4. No path (e.g. `https://example.test`): false.
+     * 5. Extension (lower-cased, from the path) `css`, `js`, `woff2`, `woff` or `ttf`: true for
+     *    relative URLs; otherwise true only when the host equals `home_url()`'s host or is listed in
+     *    `settings.areas.css_domains` (comma-separated, entries not trimmed).
+     * 6. Any other extension: true iff in {@see $PROCESSABLE_EXTENSIONS} (any host; `eot`/`otf`
+     *    are not host-restricted).
+     *
+     * Examples: `https://other.test/a.JPG` true; `https://other.test/a.css` false (not the site);
+     * `/a.css` true; `https://example.test/` false; `/a.jpg"onerror=x` false.
+     *
+     * @todo isValid() does not trim the entries of `css_domains`, so `a.test, b.test` never
+     *       matches `b.test`. Apply `array_map('trim', ...)`.
+     *
+     * @param string $url URL to check.
+     * @return bool
+     */
     public static function isValid($url) {
 		$url = trim( html_entity_decode($url), " \t\n\r\0\x0B\xC2\xA0'\"" );
 		if ( strlen( $url ) == 0 ) {
+			return false;
+		}
+
+		//XSS: real URLs never contain these once decoded, a crafted one would break out of the attribute
+		if ( preg_match( '/[<>"\'`]/', $url ) ) {
 			return false;
 		}
 
@@ -65,6 +163,40 @@ class ShortPixelUrlTools {
 		return false;
 	}
 
+	/**
+	 * Turns a URL found in a page or CSS file into an absolute URL.
+	 *
+	 * Input grammar and result, by the first matching form (`proto` = `is_ssl()` ? https : http):
+	 * ```
+	 * scheme://host/...   -> unchanged
+	 * //host/...          -> proto://host/...
+	 * /path               -> cssScheme://cssHost/path         when $cssPath is a URL
+	 *                     -> homeScheme://homeHost/path       otherwise (home port and sub-path dropped)
+	 * rel/path            -> normalizePath($cssPath . rel/path), with get_home_path() swapped for
+	 *                        trailingslashit(get_home_url())   when $cssPath is a file-system path under the WP root
+	 *                     -> normalizePath(trailingslashit(dirname($cssPath)) . rel/path)  when $cssPath is a URL
+	 *                     -> rel/path unchanged                when $cssPath is any other string
+	 *                     -> trailingslashit(home_url($wp->request)) . rel/path  without $cssPath
+	 * ```
+	 * The result always goes through filter `shortpixel/ai/originalUrl`. An empty string yields
+	 * the current page URL. Relative URLs need the global `$wp` (front-end request).
+	 *
+	 * Examples (site `https://example.test`, page `/blog/post/`): `//cdn.test/a.jpg` gives
+	 * `https://cdn.test/a.jpg`; `/a.jpg` gives `https://example.test/a.jpg`; `a.jpg` gives
+	 * `https://example.test/blog/post/a.jpg`.
+	 *
+	 * @todo absoluteUrl() with a URL `$cssPath` (as `ShortPixelAI::parse_cached_css_wpo()` passes)
+	 *       is wrong twice: `dirname()` of the already-trailing-slashed directory drops its last
+	 *       segment, and normalizePath() collapses `https://` to `https:/`. Use the directory as is
+	 *       and normalise only the path component.
+	 * @todo absoluteUrl() drops the port of `home_url()` for root-relative URLs
+	 *       (`http://localhost:8080` gives `http://localhost/a.jpg`). Append `:<port>` when present.
+	 *
+	 * @param string       $url     URL as found.
+	 * @param false|string $cssPath Directory (path or URL, trailing slash) of the CSS file that
+	 *                              contains the URL, or false.
+	 * @return string The absolute URL (filtered).
+	 */
 	static function absoluteUrl($url, $cssPath = false) {
         $url = trim($url);
         $URI = parse_url($url);
@@ -103,11 +235,14 @@ class ShortPixelUrlTools {
                 $retURL =  trailingslashit(home_url($wp->request)) . $url;
             }
         }
-        return apply_filters('shortpixel/ai/originalUrl', $retURL); //# 37750
+        return apply_filters('shortpixel/ai/originalUrl', $retURL);
     }
 
     /**
-     * this is a copy of the wp-admin/includes/file.php - we don't want to include it in the front-end
+     * Copy of `get_home_path()` from `wp-admin/includes/file.php` (not loaded on the front end):
+     * the file-system root of the site, with forward slashes and a trailing slash. When home and
+     * site URL differ, it is derived from `$_SERVER['SCRIPT_FILENAME']`; otherwise `ABSPATH`.
+     *
      * @return string
      */
     static function get_home_path() {
@@ -127,9 +262,16 @@ class ShortPixelUrlTools {
 
 
     /**
-     * remove the a/b/../.. parts
-     * @param $path
-     * @return null|string|string[]
+     * Collapses `//` and `/./` to `/`, and `/<segment>/../` to `/`, repeatedly until stable.
+     *
+     * Grammar: only segments without a dot are collapsed by `..` (`/v1.2/../` stays); a trailing
+     * `/..` without slash stays; leading `../` stays. Applied to a URL it also turns `https://` into
+     * `https:/` (see the absoluteUrl() todo).
+     *
+     * Example: `/a/b/../c/./d//e` gives `/a/c/d/e`.
+     *
+     * @param string $path Path (or URL).
+     * @return string The normalised path.
      */
     public static function normalizePath($path) {
         do {
@@ -142,9 +284,15 @@ class ShortPixelUrlTools {
     }
 
     /**
-     * remove fragment from the beginning and from the end, if found. If $frag is array, do this for each item
-     * @param string $text
-     * @param string|array $frag
+     * Removes `$frag` once from the start and once from the end of `$text`, if present there.
+     * With an array, does so for each fragment in order. No caller in the plugin.
+     *
+     * Example: `trimSubstring('"a"', '"')` gives `a`.
+     *
+     * @todo trimSubstring() has no caller; remove it.
+     *
+     * @param string          $text
+     * @param string|string[] $frag
      * @return string
      */
     public static function trimSubstring($text, $frag) {
@@ -165,6 +313,13 @@ class ShortPixelUrlTools {
         return $text;
     }
 
+    /**
+     * Scheme of the current request: `https` when `$_SERVER['HTTPS']` is `on` or `1`, or
+     * `HTTP_X_FORWARDED_PROTO` is `https`; else `http`. Used by {@see isValid()} for
+     * protocol-relative URLs. Unlike `is_ssl()` it honours the forwarded header.
+     *
+     * @return string `https` or `http`.
+     */
     public static function getCurrentScheme() {
         if (isset($_SERVER['HTTPS']) &&
             ($_SERVER['HTTPS'] == 'on' || $_SERVER['HTTPS'] == 1) ||
@@ -177,6 +332,29 @@ class ShortPixelUrlTools {
         }
     }
 
+    /**
+     * Returns the pixel size of the image a URL points to, cheapest source first, memoised in
+     * `$SIZE_CACHE` per URL string.
+     *
+     * Sources, in order:
+     * 1. File name suffix `-<W>x<H>.<ext>` at the end of the URL (optional `?query`, trailing
+     *    whitespace), when `<H>` < 10000 and `SPAI_FILENAME_RESOLUTION_UNSAFE` is NOT defined
+     *    (defining it disables this heuristic for sites whose names carry other dimensions).
+     *    Result `[W, H, 'thumb' => true]` with W and H as strings.
+     * 2. The file on disk: {@see url_to_path_to_sizes()} (a `getimagesize()` array, or `[w, h]` for SVG).
+     * 3. When that fails and option `settings_behaviour_sizespostmeta` is on: attachment metadata
+     *    via {@see url_to_metadata_to_sizes()}.
+     * 4. Fallback `[1, 1]`.
+     *
+     * Output grammar: `[W, H]` | `[W, H, 'thumb' => true]` | `getimagesize()` array (indexes 0..3,
+     * `bits`, `mime`, ...). Index 0/1 are always set. `'thumb'` set means "size from file name".
+     *
+     * Example: `get_image_size('https://example.test/wp-content/uploads/a-300x200.jpg')` gives
+     * `['300', '200', 'thumb' => true]` without touching the disk.
+     *
+     * @param string $url Image URL (absolute or relative).
+     * @return array
+     */
     public static function get_image_size($url) {
         if(isset(self::$SIZE_CACHE[$url])) {
             return self::$SIZE_CACHE[$url];
@@ -184,7 +362,7 @@ class ShortPixelUrlTools {
         if(defined('SPAI_FILENAME_RESOLUTION_UNSAFE')) { // cases like painting-cm-80x110.jpg - bragetto.it - 80x110 are the original painting size in cm :)
             $matches = array();
         } else {
-            //HS#50381 - changed to avoid being fooled by filenames like Poster-42x59.4-сm-1.jpeg
+            //changed to avoid being fooled by filenames like Poster-42x59.4-сm-1.jpeg
             preg_match("/-([0-9]+)x([0-9]+)\.[a-zA-Z0-9]+(?:|\?.*)\s*$/", $url, $matches); //the filename suffix way
         }
         if(isset($matches[1]) && isset($matches[2]) && $matches[2] < 10000) { //encountered cases when the height was set to 99999 in the name, rely on actual image sizes in that case
@@ -202,6 +380,29 @@ class ShortPixelUrlTools {
         return $sizes;
     }
 
+    /**
+     * Maps an image URL to a local file and returns its size.
+     *
+     * The query is dropped and relative URLs are made absolute. Then, until a file exists
+     * ({@see spai_safe_file_exists()}, which honours `open_basedir`):
+     * 1. uploads base URL replaced by uploads base dir (`wp_upload_dir()`, scheme-insensitive);
+     * 2. the parent of both (normally `wp-content`);
+     * 3. their grandparent mapped to the site root (`get_home_path()` when loaded, else `ABSPATH`);
+     * 3bis. multisite: the URL part after the last two segments of the uploads base dir
+     *    (`wp-content/uploads`, or `sites/N` on multisite) appended to the base dir;
+     * 4./5. root-relative fallbacks (unreachable, see todo);
+     * then the path is normalised, tried raw and urldecoded, and finally
+     * `ABSPATH/wp-content/uploads/<grandparent>/<parent>/<file>` built from the last three URL
+     * segments.
+     *
+     * @todo url_to_path_to_sizes() guards the TAKE4/TAKE5 fallbacks with
+     *       `preg_match('/https?:\/\//', $image_url) === false`, which is true only on a PCRE error,
+     *       so those branches never run. Use `!preg_match(...)`.
+     *
+     * @param string $image_url Image URL.
+     * @return array|false `getimagesize()` array, `[w, h]` for SVG, `[1, 1]` when the file is
+     *                     outside open_basedir, or false when no file is found or unreadable.
+     */
     public static function url_to_path_to_sizes($image_url) {
         //get rid of query if present
         $image_url = explode('?', $image_url)[0];
@@ -270,10 +471,10 @@ class ShortPixelUrlTools {
         if ($abs2 && self::spai_safe_file_exists($abs2)) {
             return self::getimagesizeOrSvg($abs2);
         } else {
-            //LOG open_basedir warnings: https://secure.helpscout.net/conversation/1229180365/34854/
+            //LOG open_basedir warnings
             SHORTPIXEL_AI_DEBUG && !self::check_open_basedir($path) && ShortPixelAILogger::instance()->log('URL TO PATH TO SIZES: OPEN_BASEDIR (' . ini_get('open_basedir') . ') restriction in effect!');
 
-            //try the default location for cases like this one which had wrong baseurl so the replace above did not work: https://secure.helpscout.net/conversation/943639884/20602?folderId=1117588
+            //try the default location for sites with a wrong baseurl, where the replace above did not work
             $path = trailingslashit(ABSPATH) . 'wp-content/uploads/' . wp_basename(dirname(dirname($image_url))) . '/' . wp_basename(dirname($image_url)) . '/' . wp_basename($image_url);
             if(self::spai_safe_file_exists($path)) {
                 return self::getimagesizeOrSvg($path);
@@ -284,6 +485,16 @@ class ShortPixelUrlTools {
         return false;
     }
 
+    /**
+     * Size of a local file: for `.svg`, the width/height of the `viewBox` (4 non-negative numbers),
+     * else the `width`/`height` attributes of `<svg>` (unitless or px), both rounded; else
+     * `getimagesize()`.
+     *
+     * @param string $path File-system path (normalised with {@see spai_normalize_fs_path()}).
+     * @return array|false `[w, h]` (floats from round()) for SVG, `[1, 1]` for an unparsable SVG or a
+     *                     path refused by normalisation/open_basedir, else the `getimagesize()`
+     *                     result (false for non-images).
+     */
     static function getimagesizeOrSvg($path) {
         $abs = ShortPixelUrlTools::spai_normalize_fs_path($path);
         if (!$abs || !ShortPixelUrlTools::check_open_basedir($abs)) {
@@ -314,6 +525,24 @@ class ShortPixelUrlTools {
         }
     }
 
+    /**
+     * Returns the URL of the full-size original of a WordPress thumbnail URL (used by LQIP to
+     * share placeholders between sizes).
+     *
+     * The suffix `-<W>x<H>[_c|_tl|_tr|_bl|_br]` before the extension is stripped. With option
+     * `settings_behaviour_sizespostmeta` on, the first of (stripped URL, absolute stripped URL,
+     * absolute original URL) that `attachment_url_to_postid()` resolves is returned, else `$url`;
+     * with it off, `absoluteUrl(<stripped>)` is returned.
+     *
+     * Example (postmeta off): `/wp-content/uploads/a-300x200.jpg` gives `https://example.test/wp-content/uploads/a.jpg`.
+     *
+     * @todo get_full_size_image_url() leaves `$no_thumb_url` undefined when
+     *       SPAI_FILENAME_RESOLUTION_UNSAFE is defined (warning, then a lookup of null). Initialise
+     *       it to `$url` before the `if`.
+     *
+     * @param string $url Image URL.
+     * @return string The parent URL.
+     */
     static function get_full_size_image_url($url) {
 
 
@@ -341,6 +570,23 @@ class ShortPixelUrlTools {
 
     }
 
+    /**
+     * Rounds a resolution up to a geometric breakpoint `ceil(base * multiplier^k)`.
+     *
+     * Returns `$base` for resolutions up to `$base`; `ceil($resolution)` when it does not exceed
+     * the breakpoint of `k = floor(log(resolution / base, multiplier))`; else the next breakpoint.
+     * No caller in the plugin.
+     *
+     * Example: `get_size_breakpoint(40)` gives 50; `get_size_breakpoint(56)` gives 56.0 (56 does not exceed
+     * its breakpoint, so `ceil()` of the resolution is returned).
+     *
+     * @todo get_size_breakpoint() has no caller; remove it.
+     *
+     * @param int|float $resolution
+     * @param int       $base
+     * @param float     $multiplier
+     * @return float|int
+     */
     static function get_size_breakpoint($resolution, $base = 50, $multiplier = 1.1 ) {
         if($resolution <= $base) return $base;
         $exponent = floor(log(doubleval($resolution) / $base, $multiplier));
@@ -348,6 +594,15 @@ class ShortPixelUrlTools {
         return ceil($base * pow($multiplier, $exponent + 1));
     }
 
+    /**
+     * True when `open_basedir` is unset or `$path` starts with one of its entries.
+     *
+     * Entries are split on `:` and `;` (so Windows drive letters such as `C:\` split wrongly) and
+     * compared as plain prefixes (`/var/www` also allows `/var/www2`).
+     *
+     * @param string $path File-system path.
+     * @return bool
+     */
     static function check_open_basedir($path) {
         if(strlen(ini_get('open_basedir'))) {
             $basedirs = preg_split('/[:;]/', ini_get('open_basedir'));
@@ -365,7 +620,17 @@ class ShortPixelUrlTools {
         return true;
     }
 
-    /** converts any relative/absolute path to an absolute path under WP dir */
+    /**
+     * Converts a path to an absolute path under the WordPress root (`get_home_path()` when
+     * loaded, else `ABSPATH`, without trailing slash, `wp_normalize_path()`-ed).
+     *
+     * Returns false for empty input or anything with a URL scheme (`x://`). A path already under
+     * the root is returned as is; any other path, absolute or relative, is appended to the root
+     * (so `/tmp/a.jpg` becomes `<root>/tmp/a.jpg`: lookups never leave the WP root).
+     *
+     * @param string $candidate Path.
+     * @return false|string
+     */
     private static function spai_normalize_fs_path($candidate) {
         if (!$candidate || preg_match('#^[a-z][a-z0-9+.\-]*://#i', $candidate)) return false; // e URL, nu cale
         $root = wp_normalize_path( untrailingslashit( function_exists('get_home_path') ? get_home_path() : ABSPATH ) );
@@ -382,7 +647,13 @@ class ShortPixelUrlTools {
         return $root . '/' . ltrim($p, '/');
     }
 
-    /** check if the file exists on the disk, but only if the path is allowed by open_basedir */
+    /**
+     * `file_exists()` (warnings suppressed) on the normalised path, false when normalisation
+     * fails or `open_basedir` forbids the path.
+     *
+     * @param string $candidate Path.
+     * @return bool
+     */
     private static function spai_safe_file_exists($candidate): bool {
         $abs = self::spai_normalize_fs_path($candidate);
         if (!$abs) return false;
@@ -390,6 +661,15 @@ class ShortPixelUrlTools {
         return @file_exists($abs);
     }
 
+    /**
+     * Returns the raw (serialized) `_wp_attachment_metadata` of the attachment whose URL is
+     * `absoluteUrl($image_url)`, resolved with `attachment_url_to_postid()` (not by GUID, despite
+     * the name).
+     *
+     * @param string $image_url Attachment URL.
+     * @param bool   $fuzzy     Unused.
+     * @return false|string|null The serialized metadata, null when the row is missing, false when no attachment matches.
+     */
     static function get_from_meta_by_guid($image_url, $fuzzy = false) {
         global $wpdb;
         $prefix = $wpdb->prefix;
@@ -408,8 +688,21 @@ class ShortPixelUrlTools {
         return $meta;
     }
     /**
-     * @param $image_url
-     * @return array
+     * Size of an image from its attachment metadata (database), used by {@see get_image_size()}
+     * when option `settings_behaviour_sizespostmeta` is on and the file is not found on disk.
+     *
+     * The `-<W>x<H>` suffix (and query/fragment) of jpg/jpeg/png/gif URLs is stripped to find the
+     * parent attachment. Lookups, until one returns metadata: stripped URL; for `http://` URLs the
+     * `https://` variant; the last three path segments; the original URL. From the metadata:
+     * `[width, height]` when `file` is a suffix of the original URL, else the entry of `sizes` whose
+     * `file` equals the original basename.
+     *
+     * @todo url_to_metadata_to_sizes() only tries the other protocol for `http://` URLs (the inner
+     *       `https` branch is unreachable), so `https://` URLs stored as `http://` are missed. Test
+     *       both prefixes.
+     *
+     * @param string $image_url Image URL.
+     * @return array `[width, height]`, or `[1, 1]` when nothing matches.
      */
     public static function url_to_metadata_to_sizes ( $image_url ) {
         //TODO be smart. If a certain url's domain is not found in the metadata, doesn't make sense to search for the other URLs on the same domain
@@ -465,6 +758,16 @@ class ShortPixelUrlTools {
         return array(1, 1);
     }
 
+    /**
+     * True when the trimmed URL ends in `.<extension>` (case-sensitive; a query string defeats it).
+     * With an array, true when any extension matches.
+     *
+     * Example: `is('a.woff2', ShortPixelUrlTools::$ONLY_STORE)` is true; `is('a.SVG', 'svg')` is false.
+     *
+     * @param string          $url
+     * @param string|string[] $extension Extension(s) without the dot.
+     * @return bool
+     */
     public static function is($url, $extension) {
         if(is_array($extension)) {
             foreach($extension as $ext) {
@@ -479,7 +782,13 @@ class ShortPixelUrlTools {
     }
 
 	/**
-	 * Method retrieves filename from the provided image URL if URL is valid
+	 * Returns the part after the last `/` of a valid URL (the whole URL when it has no `/`),
+	 * including any query string; false for empty or invalid URLs ({@see isValid()}).
+	 *
+	 * Example: `retrieve_name('https://example.test/a/b.jpg')` gives `b.jpg`.
+	 *
+	 * @todo retrieve_name() calls `mb_strrpos()`, which WordPress does not polyfill, so it fatals
+	 *       without the mbstring extension. Use `strrpos()`/`substr()` (byte-safe for `/`).
 	 *
 	 * @param string $url
 	 *
@@ -494,13 +803,30 @@ class ShortPixelUrlTools {
 	}
 
 	/**
-	 * Method generates the SVG placeholder using new template
+	 * Builds the lazy-loading placeholder that replaces an image URL server-side.
 	 *
-	 * @param bool|int    $width
-	 * @param bool|int    $height
-	 * @param bool|string $url
+	 * LQIP: when option `settings_behaviour_lqip` is on, `LQIP::_()->get($url)` supplies a cached
+	 * low-quality SVG template; when there is none and `$url` is not empty, the URL is queued in
+	 * `ShortPixelAI::_()->blankInlinePlaceholders[$url] = ['source' => $url, 'url' => absoluteUrl($url), 'referer' => false]`
+	 * for LQIP generation (cron or instant, see `ShortPixelAI::maybe_replace_images_src()`).
 	 *
-	 * @return string
+	 * Output grammar:
+	 * ```
+	 * data:image/svg+xml;base64,<PX_SVG_ENCODED>                       width, height and url all empty
+	 * data:image/svg+xml;base64,base64(T with %WIDTH%=W, %HEIGHT%=H, %URL%=urlencode(url))
+	 *   T = LQIP template if any, else PX_SVG_TEMPLATE
+	 *   W, H = width/height (empty one becomes 1) when width > 1 or height > 1, else 1 and 1
+	 * ```
+	 * `urlencode()` encodes spaces as `+`. The front-end JS reads `data-u` back to build the CDN URL.
+	 *
+	 * Example (no LQIP): `generate_placeholder_svg(300, 200, 'https://example.test/a.jpg')` gives
+	 * `'data:image/svg+xml;base64,' . base64_encode('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 200" width="300" height="200" data-u="https%3A%2F%2Fexample.test%2Fa.jpg" data-w="300" data-h="200" data-bip=""></svg>')`.
+	 *
+	 * @param bool|int|string $width  Pixel width (strings from file names accepted), or false.
+	 * @param bool|int|string $height Pixel height, or false.
+	 * @param bool|string     $url    Original image URL, or false.
+	 *
+	 * @return string The `data:` URI.
 	 */
 	public static function generate_placeholder_svg( $width = false, $height = false, $url = false ) {
 		$defaults = [
@@ -608,12 +934,32 @@ class ShortPixelUrlTools {
 //    }
 
     /**
-     * Method parses base64 encoded string and returns the url if it was specified
-     * !!!! also present server-side in commons/bl/url-tools.php
+     * Reads the original URL back out of a placeholder made by {@see generate_placeholder_svg()}.
+     * The same algorithm exists on the CDN side and in `ShortPixelCLI`.
      *
-     * @param string $encoded
+     * Steps: the base64 regex `(?:[A-Za-z0-9+]{4})*(?:[A-Za-z0-9+]{2}==|[A-Za-z0-9+]{3}=)?$`
+     * (unanchored at the start) takes the longest aligned run of base64 chars at the END of the
+     * input; it always matches, possibly empty, so the `count !== 1` guard never fires. The run is
+     * decoded and `data-u="..."` is searched in it; the value is `urldecode()`d.
      *
-     * @return bool|string|string[]
+     * Input grammar: `data:image/svg+xml;base64,<b64>` (also any other string, e.g. a plain URL,
+     * which yields false). Output: the URL, or false.
+     *
+     * Example: for `generate_placeholder_svg(300, 200, 'https://example.test/a.jpg')` the result
+     * is `https://example.test/a.jpg` only if no `/` occurs in the base64 text from the `data-u`
+     * part onwards; otherwise false (see todo).
+     *
+     * @todo url_from_placeholder_svg() omits `/` from the base64 alphabet, so the run starts after
+     *       the last `/` of the payload and placeholders whose base64 has a `/` at or after the
+     *       `data-u` attribute decode to false. With `PX_SVG_TEMPLATE` and the urlencode()d URL the
+     *       base64 text after `data-u` contains no `/`, so the failure needs an LQIP template or
+     *       another payload. Use
+     *       `[A-Za-z0-9+\/]` and take everything after `base64,`. The copy in ShortPixelCLI has
+     *       the same defect.
+     *
+     * @param string $encoded Placeholder `data:` URI.
+     *
+     * @return false|string The original URL, or false.
      */
     public static function url_from_placeholder_svg( $encoded )
     {
@@ -640,6 +986,22 @@ class ShortPixelUrlTools {
         return urldecode(str_replace('data-u="', '', $matches[0]));
     }
 
+    /**
+     * CSP support: attaches the nonce from filter `spai_script_nonce` (default `''`) to a
+     * registered script as extra data `nonce` (`wp_scripts()->add_data($name, 'nonce', $nonce)`).
+     * Nothing happens when the filter returns an empty value.
+     *
+     * Grammar: `add_filter('spai_script_nonce', fn() => '<nonce>')` then, for each handle below,
+     * `wp_scripts()->get_data(<handle>, 'nonce') === '<nonce>'`. The plugin itself does not print
+     * the stored value; inline scripts (`#spai_js`, localized objects) get no nonce.
+     *
+     * Called for seven handles: `spai-admin-scripts`, `spai-sniper` (ShortPixelAI), `spai-settings`
+     * (Page), `spai-notice` (Notice), `spai-lqip` (LQIP), `spai-front-worker` (JsLoader),
+     * `spai-snip-action` (VanillaJsLoader). `docs/csp_nonce_documentation.md` lists only three.
+     *
+     * @param string $name Script handle.
+     * @return void
+     */
     public static function applyNonce($name)
     {
         $nonce = apply_filters( 'spai_script_nonce', '' );

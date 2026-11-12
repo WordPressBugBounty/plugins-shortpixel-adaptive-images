@@ -7,6 +7,67 @@
 	use ShortPixel\AI\Notice\Constants;
 	use ShortPixel\AI\Options\Option;
 
+	/**
+	 * Admin notices of the plugin: markup, dismissal storage, the list of local notices and the remote feed.
+	 *
+	 * Markup (`$template`): `<div class="notice notice-<type> [is-dismissible]" data-icon data-causer data-spainonce
+	 * data-plugin="short-pixel-ai"><div class="body-wrap"><div class="message-wrap">…</div><div class="buttons-wrap">…
+	 * </div></div></div>`. `assets/js/notice.js` binds to `.notice[data-plugin="short-pixel-ai"]` buttons with
+	 * `[data-action]` and to `button.notice-dismiss` (the X, which sends action `dismiss`), and posts
+	 * `action=shortpixel_ai_handle_notice_action`, `causer` (from `data-causer`), `spainonce` (from `data-spainonce`),
+	 * `data[action]`, `data[additional]` to `Notice\Actions::handle()`. A button whose action names a `jQuery.<fn>`
+	 * runs that function instead (e.g. `spaiProposeUpgrade`).
+	 *
+	 * Dismissals: `Options` path `notices.dismissed`, an `Option` whose keys are the snake_cased causers
+	 * (`Notice::dismiss( 'wp rocket lazy' )` stores `notices.dismissed.wp_rocket_lazy`; snake-casing happens in
+	 * `Options::optionCreator()`) and whose values are `time()` or a given value (the version for `beta`).
+	 *
+	 * Local notices rendered by `renderNotices()` (`admin_notices`, `manage_options` only). "Key" is the dismissal key
+	 * the condition checks; "Handler" is the `Notice\Actions` method reached from `data-causer`:
+	 *
+	 * | Causer (`data-causer`)   | Shown when                                                                      | Key checked             | Handler / actions |
+	 * |--------------------------|---------------------------------------------------------------------------------|-------------------------|-------------------|
+	 * | `ao`                     | `ShortPixelAI::is_conflict() === 'ao'`; not dismissible                         | none                    | `handleAo`: `solve conflict` |
+	 * | `avadalazy`, `ginger`, `speedoptimizer`, `divitoolbox` | matching `is_conflict()`; not dismissible, link buttons only | none        | none |
+	 * | `mbstring`               | `mb_convert_case()` missing; not dismissible                                    | none                    | none |
+	 * | `beta`                   | `ShortPixelAI::is_beta()` and dismissed value is not the current version        | `beta`                  | `handleBeta`: `dismiss` (stores version) |
+	 * | `on boarding`            | never (`false &&` guard)                                                        | `on_boarding`           | `handleOnBoarding`: `redirect`, `dismiss` |
+	 * | `lazy`                   | transient `shortpixelai_thrown_notice['when'] == 'lazy'` (deleted afterwards)   | `lazy`                  | `handleLazy`: `dismiss forever` only |
+	 * | `recommend_survey`       | settings page, `shortpixel_ai_installed_time` >= 30 days ago                     | `recommend_survey`      | `handleRecommendSurvey`: `dismiss`; ratings go to `Feedback` |
+	 * | `wp rocket defer js`     | WP Rocket `defer-all-js` active                                                 | `wp_rocket_defer_js`    | `handleWpRocketDeferJs`: `solve conflict`, `dismiss` |
+	 * | `wp rocket lazy`         | WP Rocket `lazyload` active                                                     | `wp_rocket_lazy`        | `handleWpRocketLazy`: `dismiss` |
+	 * | `wprocketcss`            | `parse_css_files > 0`, WP Rocket `minify-css` without `css-filter`              | `wprocketcss`           | `handleWpRocketCss` (case-insensitive match): `dismiss` stores `wp_rocket_css` |
+	 * | `key`                    | not on wizard, `flags.all.account` falsy, remote account has a `key`            | `key`                   | `handleKey`: `use account`, `dismiss` |
+	 * | `remote_get_error`       | account or domain status call returns no `Status` or `Status == -3`             | none                    | none (no `handleRemoteGetError`) |
+	 * | `credits`                | `getCreditsNoticeInfo()` non-empty (domain `Status` not 2 and not -3)           | `credits`               | `handleCredits`: `check`, `dismiss` |
+	 * | `twicelossy`             | SPAI `lossy`, SPIO active with `wp-short-pixel-compression == '1'`, not wizard  | `twicelossy`            | `handleTwicelossy`: `dismiss` |
+	 * | `missing jquery`         | `tests.front_end.missing_jquery`                                                | `missing_jquery`        | `handleMissingJquery`: `re-check`, `dismiss` |
+	 * | `temporary redirect`     | refreshed domain status has `TemporaryRedirectOrigin` true                      | `temporary_redirect`    | `handleTemporaryRedirect`: `re-check`, `dismiss` stores `missing_jquery` |
+	 * | `swift performance`      | Swift Performance `has_bug` and `has_conflict`, CSS parsing on                  | `swift_performance`     | `handleSwiftPerformance`: `solve conflict`, `dismiss` |
+	 * | `imagify`                | Imagify `has_conflict`                                                          | `imagify`               | `handleImagify`: `solve conflict`, `dismiss` |
+	 * | `spio webp`              | SPIO active with `wp-short-pixel-create-webp-markup`                            | `spio_webp`             | `handleSpioWebp`: `solve conflict`, `dismiss` |
+	 * | `litespeed js combine`   | option `litespeed.conf.optm-js_comb` non-empty                                  | `litespeed_js_combine`  | `handleLitespeedJsCombine`: `solve conflict`, `dismiss` |
+	 * | `wpo merge css`          | WP-Optimize `enable_merging_of_css`                                             | `wpo_merge_css`         | `handleWpoMergeCss`: `solve conflict`, `add exclusions`, `dismiss` |
+	 * | `lqip mkdir failed`      | transient `spai_lqip_mkdir_failed`; also sets `settings.behaviour.lqip = false` | `lqip_mkdir_failed`     | none (no `handleLqipMkdirFailed`) |
+	 * | `remote_info_notice___<id>` | remote feed, see `display_remote_notices()`                                  | `remote_info_notice___<id>` | `handleRemoteInfoNotice`: `dismiss` |
+	 *
+	 * Remote feed: `ShortPixelAI::REMOTE_MESSAGE_ENDPOINT` (`https://api.shortpixel.com/v2/notices.php`) with
+	 * `version`, `target=2` and `key` (the API key), cached 1 h in the object cache and the `spai_remote_notice`
+	 * transient.
+	 *
+	 * @todo `wprocketcss` is dismissed under `wp_rocket_css` (`Notice\Actions::handleWpRocketCss()`) but
+	 *       `renderNotices()` checks `wprocketcss`, so the notice comes back. Dismiss with causer `wprocketcss`.
+	 * @todo `temporary redirect` is dismissed under `missing_jquery` (`Notice\Actions::handleTemporaryRedirect()`)
+	 *       while `renderNotices()` checks `temporary_redirect`; it also hides the jQuery notice. Dismiss
+	 *       `temporary redirect`.
+	 * @todo `lazy`: the X button sends `dismiss` but `Notice\Actions::handleLazy()` accepts only `dismiss forever`,
+	 *       so the X answers with the "API key is invalid" error. Accept both actions.
+	 * @todo `lqip mkdir failed` and `remote_get_error` are rendered dismissible but have no handler in
+	 *       `Notice\Actions`, so the X shows the "API key is invalid" error and nothing is stored (and nothing checks
+	 *       a `remote_get_error` dismissal). Add handlers (and a dismissal check) or render them non-dismissible.
+	 * @todo In `renderNotices()` the Swift Performance condition `!!$this->ctrl->settings->areas->parse_css_files > 0`
+	 *       evaluates `(!!x) > 0`, so it is also true for `-1` (explicitly disabled). Use `parse_css_files > 0`.
+	 */
 	class Notice {
 		/**
 		 * @var \ShortPixel\AI\Notice Instance of class
@@ -14,22 +75,23 @@
 		private static $instance;
 
 		/**
-		 * @var string $template Notice template
+		 * @var string $template Notice markup with the placeholders `{{ NOTICE CLASSES }}`, `{{ NOTICE ICON }}`,
+		 *                       `{{ CAUSER }}`, `{{ SPAI NONCE }}`, `{{ MESSAGE }}`, `{{ BUTTONS }}` (see class docblock).
 		 */
 		private static $template = '<div class="{{ NOTICE CLASSES }}" data-icon="{{ NOTICE ICON }}" data-causer="{{ CAUSER }}" data-spainonce="{{ SPAI NONCE }}" data-plugin="short-pixel-ai"><div class="body-wrap"><div class="message-wrap">{{ MESSAGE }}</div><div class="buttons-wrap">{{ BUTTONS }}</div></div></div>';
 
 		/**
-		 * @var array $allowed_types Valid notice classes
+		 * @var string[] $allowed_types Valid notice types, rendered as the `notice-<type>` class; others add no class.
 		 */
 		private static $allowed_types = [ 'success', 'error', 'warning', 'info' ];
 
 		/**
-		 * @var array $allowed_icons Valid notice icons
+		 * @var string[] $allowed_icons Valid `data-icon` values; anything else (or empty) renders as `none`.
 		 */
 		private static $allowed_icons = [ 'scared', 'happy', 'wink', 'cool', 'magnifier', 'notes' ];
 
 		/**
-		 * @var array $allowed_button_types Valid notice button types
+		 * @var string[] $allowed_button_types Button types: `link` renders `<a>`, anything else renders `<button>`.
 		 */
 		private static $allowed_button_types = [ 'link', 'button' ];
 
@@ -39,9 +101,9 @@
 		private $ctrl;
 
 		/**
-		 * Single ton implementation
+		 * Returns the singleton, creating it (and registering the hooks) on first call.
 		 *
-		 * @param \ShortPixelAI|null $controller
+		 * @param \ShortPixelAI|null $controller Required on the first call (hooks read `$this->ctrl`).
 		 *
 		 * @return \ShortPixel\AI\Notice
 		 */
@@ -50,20 +112,28 @@
 		}
 
 		/**
-		 * Method renders the admin notice using passed parameters
+		 * Echoes `get( $causer, $data )`.
 		 *
-		 * @param null|string $causer
-		 * @param null|array  $data
+		 * @param null|string $causer Value of `data-causer` (see the causer table in the class docblock).
+		 * @param null|array  $data   See `get()`.
+		 *
+		 * @return void
 		 */
 		public static function render( $causer = null, $data = null ) {
 			echo self::get( $causer, $data );
 		}
 
 		/**
-		 * Method creates and returns the admin notice using passed parameters
+		 * Builds the notice HTML from `$template`.
 		 *
-		 * @param null $causer
-		 * @param null $data
+		 * `$data` shape: `[ 'notice' => [ 'type' => success|error|warning|info, 'dismissible' => bool, 'icon' => one of
+		 * $allowed_icons ], 'message' => [ 'title' => string, 'body' => string[], 'buttons' => array (see
+		 * `renderButtons()`) ] ]`. The title goes into `<h3>`, each body item into `<p>`. Title, body and causer are
+		 * inserted WITHOUT escaping (callers pass trusted HTML). A fresh `shortpixel-ai-settings` nonce is put in
+		 * `data-spainonce`. Only `$data['message']['buttons']` is rendered.
+		 *
+		 * @param null|string $causer Value of `data-causer`; null for transient notices returned by AJAX handlers.
+		 * @param null|array  $data   Notice description, see above.
 		 *
 		 * @return string
 		 */
@@ -132,6 +202,19 @@
 				self::$template );
 		}
 
+		/**
+		 * Builds the buttons HTML.
+		 *
+		 * Each button: `type` (`link` renders `<a href=url target=target>`, anything else a
+		 * `<button type="button" data-type data-action data-additional>`), `title`, `action` (the `data[action]` sent by
+		 * `notice.js`, or the name of a `jQuery` function), `additional` (JSON in an UNQUOTED `data-additional`
+		 * attribute), `primary` (`button-primary` vs `button-secondary`), `url`, `target`. Nothing is escaped.
+		 * Also used by the dismissed-notices panel in `settings.tpl.php`.
+		 *
+		 * @param array[] $buttonsArray Button descriptions.
+		 *
+		 * @return string
+		 */
 		public static function renderButtons($buttonsArray) {
 			$buttons = '';
 			foreach ( $buttonsArray as $button ) {
@@ -163,12 +246,15 @@
 		}
 
 		/**
-		 * Method adds info about dismissed notice
+		 * Records a dismissal in `notices.dismissed`.
 		 *
-		 * @param string $causer
-		 * @param mixed  $value What to put into the dismissed (for example plugin version if need to dismiss only for that version), default is time();
+		 * The causer is used as given and snake-cased when the Option is saved (`'wp rocket lazy'` ->
+		 * `wp_rocket_lazy`), so `renderNotices()` must check the snake_case key.
 		 *
-		 * @return bool
+		 * @param string $causer Causer name (any case, spaces allowed).
+		 * @param mixed  $value  Stored value, e.g. the plugin version to dismiss only for that version; default `time()`.
+		 *
+		 * @return bool Always true (see the `@todo` on `Options`).
 		 */
 		public static function dismiss( $causer, $value = null ) {
 			$dismissed = Options::_()->get( 'dismissed', 'notices', Option::_() );
@@ -181,9 +267,9 @@
 		}
 
 		/**
-		 * Method return object with information about dismissed notices
+		 * Returns the dismissed notices as a plain object `{ <snake_case causer>: time()|value }`.
 		 *
-		 * @return Option
+		 * @return \stdClass The `notices.dismissed` Option's data, or an empty object.
 		 */
         public static function getDismissed() {
             $dismissed = Options::_()->get( 'dismissed', 'notices', Option::_() );
@@ -192,9 +278,16 @@
         }
 
 		/**
-		 * Method deletes info about dismissed notification
+		 * Is meant to remove one dismissal so the notice can show again (used for `credits` by
+		 * `ShortPixelAI::account_check_handler()`).
 		 *
-		 * @param string $causer
+		 * @todo `deleteDismissing()` calls `unset( $dismissed->{$causer} )` on an `Option`, which has no `__unset()`;
+		 *       the entry lives in the protected `__dyna` bag and stays, so the method is a no-op and the `credits`
+		 *       notice never comes back. Use `$dismissed->unsetProperty( $causer )`.
+		 *
+		 * @param string $causer Causer name, snake-cased with `Converter::toSnakeCase()`.
+		 *
+		 * @return void
 		 */
 		public static function deleteDismissing( $causer ) {
 			$causer    = Converter::toSnakeCase( $causer );
@@ -208,14 +301,30 @@
 		}
 
 		/**
-		 * Method clears all dismissed notifications
+		 * Is meant to clear all dismissals.
+		 *
+		 * @todo `clearDismissed()` deletes `dismissed` in category `notice` (singular) instead of `notices`, so it
+		 *       removes nothing. Use `Options::_()->delete( 'dismissed', 'notices' )`. No caller uses it today.
+		 *
+		 * @return void
 		 */
 		public static function clearDismissed() {
 			Options::_()->delete( 'dismissed', 'notice' );
 		}
 
 		/**
-		 * Method renders all admin notices
+		 * `admin_notices` callback: renders the local notices listed in the class docblock, for `manage_options` only.
+		 *
+		 * Side effects: deletes the `shortpixelai_thrown_notice` transient (unless `lazy` is dismissed); writes
+		 * `shortpixel_ai_installed_time` on the first settings-page visit; sets `settings.behaviour.lqip = false` on
+		 * every call while `spai_lqip_mkdir_failed` is set. Remote calls: `get_shortpixel_account()` (key notice),
+		 * `get_domain_status()` (credits) and `get_domain_status( true )` (temporary redirect).
+		 *
+		 * @todo `renderNotices()` calls `ShortPixelDomainTools::get_domain_status( true )` (bypassing the
+		 *       `spai_domain_status` transient) on every admin page load until `temporary redirect` is dismissed. Use
+		 *       the cached status.
+		 *
+		 * @return void
 		 */
 		public function renderNotices() {
 			if ( !function_exists( 'current_user_can' ) || !current_user_can( 'manage_options' ) ) {
@@ -390,6 +499,7 @@
                             'message' => [
                                 'title' => __('How likely are you to recommend ShortPixel AI to a friend or colleague?', 'shortpixel-adaptive-images'),
                                 'body' => [
+                                    // Closure below: one `.survey-rating-btn[data-rating]` button per rating 1..10.
                                     '<p><span style="margin-right:1em;">' . __('Not likely', 'shortpixel-adaptive-images') . '</span>'
                                     . implode('', array_map(function ($i) {
                                         return '<button class="button survey-rating-btn" '
@@ -624,9 +734,23 @@
 		}
 
 		/**
-		 * Returns content for rendering credits notification
-		 * @param ShortPixelAI
-		 * @return array
+		 * Builds the `credits` notice message from the cached domain status.
+		 *
+		 * Empty when the status is missing, `2` (OK) or `-3` (network error). Otherwise: with an API key a
+		 * `spaiProposeUpgrade` JS button plus the hidden propose-upgrade modal markup (nonce `ajax_request`); always a
+		 * `check` button; a "quota soon exhausted" (`Status 1`) or "quota exceeded" (`-1`/`-2`) text; and either a
+		 * Log-in/Top-up link to `DEFAULT_MAIN_DOMAIN/login/<key or _>/…` (account) or a Sign-up link (no account,
+		 * affiliate filter `spai_affiliate_link`, `/af/MNCMIUS28044` appended for 4-part URLs). Also used by the
+		 * dismissed-notices panel of the settings page.
+		 *
+		 * @todo `getCreditsNoticeInfo()` appends `' DATA: ' . print_r( $domain_status, true )` to the sign-up message,
+		 *       which dumps the raw API response into the admin notice. Remove the debug output.
+		 * @todo `getCreditsNoticeInfo()` reads `$_SERVER['HTTPS']` without `isset()` (warning on plain HTTP); use
+		 *       `is_ssl()`.
+		 *
+		 * @param ShortPixelAI $ctrl
+		 *
+		 * @return array{title?: string, body?: string[], buttons?: array[]} Empty array when no notice is due.
 		 */
 		public static function getCreditsNoticeInfo(ShortPixelAI $ctrl) {
 			$ret = [];
@@ -716,6 +840,12 @@
 			return $ret;
 		}
 
+		/**
+		 * `admin_footer` callback: registers and enqueues `spai-notice` (`assets/js/notice(.min).js`, depends on
+		 * jQuery) with the CSP nonce, on every admin page.
+		 *
+		 * @return void
+		 */
 		public function enqueueAdminScripts() {
 			$scripts = [];
 			$min     = ( !!SHORTPIXEL_AI_DEBUG ? '' : '.min' );
@@ -732,7 +862,9 @@
 		}
 
 		/**
-		 * Notice constructor.
+		 * Stores the singleton and controller and hooks `renderNotices` and `display_remote_notices` on
+		 * `admin_notices`, `enqueueAdminScripts` on `admin_footer` and `Notice\Actions::handle` on
+		 * `wp_ajax_shortpixel_ai_handle_notice_action`.
 		 *
 		 * @param \ShortPixelAI $controller ShortPixel AI main controller
 		 */
@@ -750,8 +882,11 @@
 		}
 
         /**
+         * Renders the dismissible `remote_get_error` notice with the error text of a failed API call.
+         *
          * This usually is a "connection error: cURL error 28: Operation timed out after 10001 milliseconds with 0 out of 0 bytes received"
-         * @param $account
+         *
+         * @param object|mixed $account Account or domain-status response; `->Message` is shown, else "unknown error".
          * @return void
          */
         public function renderNetworkError($account)
@@ -773,8 +908,18 @@
         }
 
         /**
-         *  Set to get remote notices from API and store them both in the object cache and as a transient
-         * @return notices
+         * Returns the remote notices, fetched from `REMOTE_MESSAGE_ENDPOINT` at most once per hour.
+         *
+         * Reads `spai_remote_notice` from the object cache, then the transient; on a miss it calls
+         * `wp_safe_remote_request( notices.php?version=<SPAI version>&target=2&key=<API key> )` (default timeout),
+         * keeps the decoded body only if it is a JSON array and stores the result (or `false`) in both caches for
+         * `HOUR_IN_SECONDS`.
+         *
+         * @todo `get_remote_notices()` caches `false` "to avoid repeated requests", but `false` is also the miss value of
+         *       `wp_cache_get()`/`get_transient()`, so after a failed or non-array response the endpoint is called again
+         *       on every admin page load. Cache an empty array instead.
+         *
+         * @return object[]|false Notices `{ id, message, type }`, or false.
          */
         private function get_remote_notices()
         {
@@ -826,8 +971,20 @@
 
 
         /**
-         *  Set to display remote notices from API
+         * `admin_notices` callback: renders each remote notice that has `id` and `message` and is not dismissed.
          *
+         * Causer `remote_info_notice___<lower-cased id>`; message passed through `wp_kses_post()`; `type` maps
+         * `info` -> info/happy "Information Notice", `notice` -> success/notes "Notice", `alert` -> error/scared
+         * "Alert Notice", anything else -> info. Always dismissible. Runs for every admin user who sees
+         * `admin_notices` (no capability check, unlike `renderNotices()`).
+         *
+         * @todo `display_remote_notices()` checks the dismissal under `remote_info_notice___` + `strtolower( id )`, but
+         *       `dismiss()` stores `Converter::toSnakeCase()` of it, which also drops non-alphanumerics and turns
+         *       spaces into `_`; ids with such characters can never be dismissed. Snake-case the id here too.
+         * @todo `display_remote_notices()` has no `manage_options` check, so remote notices (with dismiss buttons that
+         *       then fail the capability check) show to every admin-area user. Add the same check as `renderNotices()`.
+         *
+         * @return void
          */
         public function display_remote_notices()
         {

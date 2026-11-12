@@ -2,9 +2,9 @@
 Contributors: ShortPixel
 Tags: image optimization, convert, webp, lazy load, avif
 Requires at least: 4.7
-Tested up to: 7.1
-Requires PHP: 5.6.40
-Stable tag: 3.11.6
+Tested up to: 7.2
+Requires PHP: 7.4
+Stable tag: 3.12.0
 License: GPLv2 or later
 License URI: http://www.gnu.org/licenses/gpl-2.0.html
 
@@ -248,6 +248,33 @@ This rule will only be applied by the New JS Engine (so you need to have the opt
 6. Advanced settings page
 
 == Changelog ==
+
+= 3.12.0 =
+
+🔒 The Security & Native Lazy-Loading Update
+
+Release Date: November 12, 2026
+
+⚙️ Improvements
+
+* Smarter Native Lazy-Loading: When the "Native lazy-loading" option is enabled, images now get their CDN address and the loading="lazy" attribute directly in the page, so the browser handles the lazy-loading on its own, with any replace method. Images that you excluded from lazy-loading or that WordPress marks as high priority don't get the attribute.
+* Lite YouTube Embeds: Background images set on <lite-youtube> elements are now optimized and served from the CDN.
+* PHP 7.4 Minimum: The plugin now requires PHP 7.4 or newer, the oldest version it is tested on.
+* Comprehensive Automated Testing: The plugin now runs a comprehensive suite of automated tests (unit, integration, compatibility, multisite and end-to-end browser tests) on every change, on all the supported PHP versions, complemented by the relevant manual tests done by our engineering and testing teams.
+* Code Documentation: Improved the overall code documentation of the plugin.
+
+🔒 Security
+
+* XSS Fix: Hardened the output escaping of the image and background image addresses that the plugin rewrites in the page, preventing a potential cross-site scripting issue, responsibly disclosed by the PatchStack and Wordfence teams.
+* Debug Mode for Administrators Only: The debug mode and the log cleanup can no longer be triggered from the page address by visitors, only by logged-in administrators.
+
+🛠️ Fixes
+
+* Image Checker Tool: Fixed adding and removing exclusion rules from the Image Checker Tool on the front-end, which failed with an "Invalid or expired nonce" error.
+* Background Image Detection: Inline background images are now matched on the exact HTML tag, fixing wrong matches on tags with similar names.
+* AJAX Responses: Plain text or numeric AJAX responses are no longer mistakenly processed as JSON.
+
+Update now for a more secure plugin and smoother lazy-loading! 🚀
 
 = 3.11.6 =
 

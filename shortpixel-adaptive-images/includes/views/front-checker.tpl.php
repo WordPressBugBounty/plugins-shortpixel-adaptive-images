@@ -1,5 +1,27 @@
 <?php
 	/**
+	 * Front-worker panel template, shown on the FRONT END while the on-boarding "run front worker" check is active.
+	 *
+	 * Included by `ShortPixel\AI\Page::render( 'front-checker.tpl.php' )` from a `wp_head` closure registered by
+	 * `ShortPixel\AI\JsLoader::enqueue()` (logged-in `manage_options` user with the `shortpixel-ai-front-worker` cookie
+	 * and a matching `pages.on_boarding.front_worker.<user ID>` token), so `$this` is the `ShortPixel\AI\Page` instance.
+	 * Assets: `spai-front-worker` (`assets/js/front.worker.js`) with `SPAIFrontConstants`.
+	 *
+	 * Variables defined here: `$controller` (`$this->ctrl`). No remote calls.
+	 *
+	 * Markup hooks used by `front.worker.js`: `.spai-popup__wrap` (checking overlay), `.spai-fw-maximize-button`,
+	 * `aside.spai-fw-sidebar` with `.back` (Done), `.spai__recommended-options-wrap[data-spainonce]` (nonce sent as
+	 * `spainonce` with `action=shortpixel_ai_handle_page_action`, `page=frontWorker`), `.option[data-option]` for
+	 * `lazy-load-backgrounds`, `parse-css`, `parse-js`, `parse-json`, `hover-handling` (checkbox `name` = option),
+	 * `.revert-confirmation` (`.cancel`, `.revert`), `.has-recommendations`, `.no-recommendations`, `.no-options`,
+	 * `.cache-message`, `[data-mission="general"] .reload`, `.collapse-button`. Icons from
+	 * `assets/img/hide-show-sprite.svg`.
+	 *
+	 * @todo The checkboxes print `checked( … )` with a short echo tag; `checked()` already echoes, so the attribute is
+	 *       printed twice. Call `checked( … );` inside a plain `php` tag instead.
+	 * @todo The panel is printed from `wp_head`, so `<div class="wrap">` and the panel markup land inside `<head>`
+	 *       (browsers move them to `<body>`). Render it on `wp_footer` or `wp_body_open`.
+	 *
 	 * @var \ShortPixelAI $controller
 	 */
 	$controller = $this->ctrl;

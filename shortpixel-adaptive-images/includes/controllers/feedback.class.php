@@ -4,21 +4,41 @@
 
 	use ShortPixelAI;
 
+	/**
+	 * Deactivation feedback popup and the NPS-style rating survey, both sent to the ShortPixel feedback API.
+	 *
+	 * Endpoint: `POST https://api.shortpixel.com/v2/feedback.php` (`ShortPixelAI::SP_API . 'v2/feedback.php'`) through
+	 * `Request::post( $url, true, [ 'body' => $body ] )`. Payload:
+	 * `{ user: { email, first_name, last_name, domain } (empty strings when anonymous),
+	 *    wordpress: { deactivated_plugin: { slug, name, version, author, uninstall_reason, uninstall_details },
+	 *                 [locale, wp_version, multisite, php_version, themes: { installed, active }, plugins: { installed,
+	 *                 active }] (only on beta versions, `ShortPixelAI::is_beta()`) },
+	 *    key?: <API key> (not anonymous) }`.
+	 *
+	 * AJAX: `wp_ajax_shortpixel_ai_handle_feedback_action` -> `Feedback\Actions::handle` (deactivation popup, nonce +
+	 * `activate_plugins`); `wp_ajax_shortpixel_ai_send_rating` and `wp_ajax_shortpixel_ai_send_feedback` ->
+	 * `handleSurveyAjax()` (survey buttons of the `recommend_survey` notice).
+	 *
+	 * Instantiated by `ShortPixelAI` in the back end and in `shortpixel_ai*` admin AJAX requests that carry `data`.
+	 */
 	class Feedback {
 		/**
-		 * @var \ShortPixel\AI\Feedback $instance
+		 * @var \ShortPixel\AI\Feedback $instance The singleton, set by the first constructor call.
 		 */
 		private static $instance;
 
 		/**
-		 * @var \ShortPixelAI $ctrl AI Controller
+		 * @var \ShortPixelAI $controller AI Controller
 		 */
 		protected $controller;
 
+        /**
+         * @var \ShortPixelAILogger $logger Plugin logger (set in the constructor, not used by this class).
+         */
         private $logger;
 
 		/**
-		 * Single ton implementation
+		 * Returns the singleton, creating it (and registering the hooks) on first call.
 		 *
 		 * @param \ShortPixelAI $controller
 		 *
@@ -28,6 +48,19 @@
 			return self::$instance instanceof self ? self::$instance : new self( $controller );
 		}
 
+		/**
+		 * Sends the deactivation feedback.
+		 *
+		 * `uninstall_details` is the suggestions text plus, when not anonymous, a `Domain: <site domain>` line. The
+		 * API key is added only when not anonymous and `get_cdn_domain_usage()` (remote) returns something truthy.
+		 *
+		 * @param string      $reason      Value of the popup's `feedback` radio (`temp`, `setup`, `documentation`,
+		 *                                 `features`, `better-plugin`, `incompatibility`, `maintenance`).
+		 * @param string|null $suggestions Free text from the popup textarea (sent unsanitised).
+		 * @param bool        $anonymous   True to omit the user data, domain and key.
+		 *
+		 * @return mixed|\WP_Error|false Decoded API response, WP_Error, or false for an empty/non-string reason.
+		 */
 		public static function send( $reason, $suggestions = null, $anonymous = false ) {
 			if ( !is_string( $reason ) || empty( $reason ) ) {
 				return false;
@@ -61,7 +94,14 @@
 		}
 
 		/**
-		 * Method generates Feedback popup
+		 * `admin_footer-plugins.php` callback: prints the hidden deactivation popup (`.deactivation-popup`,
+		 * `data-slug` = text domain) used by `admin.js`.
+		 *
+		 * Fields: `feedback` radios (reasons), `suggestions` textarea, `anonymous` checkbox, `settings` radios
+		 * (`keep` | `remove`; `revert` is behind `if(false)`), and the `[data-action="deactivation"]` button. The
+		 * nonce comes from the localized `spaiNonce.nonce`, not from this markup.
+		 *
+		 * @return void
 		 */
 		public function generatePopUp() {
 			$plugin_data = get_plugin_data( SHORTPIXEL_AI_PLUGIN_FILE );
@@ -160,6 +200,17 @@
 			<?php
 		}
 
+		/**
+		 * Builds the `wordpress` part of the payload (see class docblock).
+		 *
+		 * @todo `collectWordpressData()` compares `get_bloginfo( 'version' ) >= 4.7` as string vs float; use
+		 *       `version_compare()`. WordPress 4.7 is far below the supported floor, so `get_user_locale()` could be
+		 *       used directly.
+		 *
+		 * @param bool $detailed True to add locale, versions, multisite flag, themes and plugins.
+		 *
+		 * @return array
+		 */
 		private static function collectWordpressData( $detailed = false ) {
 			$current_plugin = get_plugin_data( SHORTPIXEL_AI_PLUGIN_FILE );
 
@@ -186,7 +237,14 @@
 		}
 
 		/**
-		 * Get a list of installed plugins
+		 * Returns installed and active plugins as title-cased folder names (`shortpixel-adaptive-images/…` ->
+		 * `Shortpixel Adaptive Images`).
+		 *
+		 * @todo `getPlugins()` skips plugins found in `$active` while `$active` is still empty (it is filled in the next
+		 *       loop, and with title-cased names, not plugin ids), so `installed` also lists the active plugins. Build
+		 *       `$active` first and compare against `active_plugins` ids.
+		 *
+		 * @return array{installed: string[], active: string[]}
 		 */
 		private static function getPlugins() {
 			if ( !function_exists( 'get_plugins' ) ) {
@@ -222,9 +280,9 @@
 		}
 
 		/**
-		 * Get current themes
+		 * Returns the installed (non-active) themes and the active theme's slug, name, version and author.
 		 *
-		 * @return array
+		 * @return array{installed: array, active: array}
 		 */
 		private static function getThemes() {
 			$theme = wp_get_theme();
@@ -241,9 +299,9 @@
 		}
 
 		/**
-		 * Get an array of installed themes
+		 * Returns the installed themes except the active stylesheet, keyed by slug.
 		 *
-		 * @return array
+		 * @return array<string, array{slug: string, name: string, version: string, author: string}>
 		 */
 		private static function getInstalledThemes() {
 			$installed = wp_get_themes();
@@ -267,11 +325,11 @@
 		}
 
 		/**
-		 * Collect user data.
+		 * Returns the current user's e-mail, first/last name and the site domain, or empty strings when anonymous.
 		 *
 		 * @param bool $anonymous
 		 *
-		 * @return array
+		 * @return array{email: string, first_name: string, last_name: string, domain: string}
 		 */
 		private static function collectUserData( $anonymous ) {
 			$user = wp_get_current_user();
@@ -294,7 +352,7 @@
 		}
 
 		/**
-		 * Feedback constructor.
+		 * Stores the singleton, logger and controller and registers the popup and AJAX hooks (see class docblock).
 		 *
 		 * @param \ShortPixelAI $controller
 		 */
@@ -312,6 +370,19 @@
             add_action( 'wp_ajax_shortpixel_ai_send_feedback', [ $this, 'handleSurveyAjax' ] );
         }
 
+        /**
+         * AJAX handler of `shortpixel_ai_send_rating` and `shortpixel_ai_send_feedback`.
+         *
+         * Reads `data[rating]` (`intval`, must be 1..10, else `wp_send_json_error( 'Invalid rating' )`) and
+         * `data[feedback]` (`sanitize_text_field`), sends them with `sendSurvey()`, answers `wp_send_json_error()` on a
+         * `WP_Error`, otherwise dismisses `recommend_survey` and answers `wp_send_json_success()`.
+         *
+         * @todo `handleSurveyAjax()` checks neither a nonce nor a capability, so any logged-in user (or a CSRF page)
+         *       can send ratings in that user's name and dismiss the survey for everybody. Add
+         *       `Page::checkSpaiNonce()` and a `manage_options` check (and send the nonce from `notice.js`).
+         *
+         * @return void
+         */
         public function handleSurveyAjax() {
 
 
@@ -333,6 +404,16 @@
         }
 
 
+        /**
+         * Sends a survey rating as feedback with `uninstall_reason = 'rating'` and
+         * `uninstall_details = 'Rating: N – Feedback: …'`, plus the API key when set and not anonymous.
+         *
+         * @param int    $rating    1..10; anything else returns false.
+         * @param string $feedback  Optional text.
+         * @param bool   $anonymous True to omit the user data and key.
+         *
+         * @return mixed|\WP_Error|false Decoded API response, WP_Error, or false for an invalid rating.
+         */
         public  function sendSurvey( $rating, $feedback, $anonymous = false ) {
 
             if ( ! is_int( $rating ) || $rating < 1 || $rating > 10 ) {

@@ -1,16 +1,45 @@
 <?php
 /**
- * User: simon
- * Date: 23.09.2019
+ * JSON rewriter for AJAX/REST responses, `application/json` scripts and JSON attributes.
+ *
+ * @package ShortPixel\AI
  */
 
+/**
+ * Walks a decoded JSON tree and rewrites the image URLs in its string leaves.
+ *
+ * Callers: `ShortPixelAI::maybe_replace_images_src()` for whole JSON responses when
+ * `settings.areas.parse_json` is on; `ShortPixelRegexParser::replace_application_json_script()`,
+ * `replace_custom_json_attr()` and the `text/template` branch of `parse()`.
+ */
 class ShortPixelJsonParser {
 
+    /**
+     * @var ShortPixelAI The plugin controller.
+     */
     protected $ctrl;
+    /**
+     * @var bool|mixed True to emit SVG placeholders (lazy) instead of CDN URLs.
+     */
     protected $lazy;
+    /**
+     * @var ShortPixelAILogger Shared logger instance.
+     */
     private $logger;
+    /**
+     * @var false|\ShortPixel\AI\TagRule The regex parser's current rule; its `used` map gets the
+     *                                  tags that received lazy placeholders.
+     */
     private $tagRule;
 
+    /**
+     * @param ShortPixelAI                 $ctrl           The plugin controller.
+     * @param false|\ShortPixel\AI\TagRule $currentTagRule Rule of the calling regex parser, or false.
+     * @param bool|mixed                   $lazy           false (default): lazy when
+     *                                                     `settings.areas.parse_json_lazy` is on and
+     *                                                     the rule (if any) is not eager; any other
+     *                                                     value (including 0) is used as is.
+     */
     function __construct(ShortPixelAI $ctrl, $currentTagRule = false, $lazy = false) {
         $this->ctrl = $ctrl;
         $this->lazy = $lazy === false ? ($ctrl->settings->areas->parse_json_lazy && (!$currentTagRule || !$currentTagRule->eager)) : $lazy;
@@ -18,6 +47,31 @@ class ShortPixelJsonParser {
         $this->tagRule = $currentTagRule;
     }
 
+    /**
+     * Rewrites the image URLs in a decoded JSON value.
+     *
+     * Input grammar: any `json_decode()` result (object, array, string, number, bool, null).
+     * Recursion ({@see parseRecursive()}), per node:
+     * - array / object: every value is parsed recursively; keys are kept; objects are modified in place.
+     * - string that itself decodes to a JSON array/object: parsed recursively and re-encoded with
+     *   `json_encode()` (default flags, so `\/` escaping).
+     * - string that looks like HTML (`/^([\s↵]*(<!--[^>]+-->)*)*<\w*(\s[^>]*|)>/s`, i.e. starts
+     *   with a tag after optional whitespace/comments): a new `ShortPixelRegexParser::parse()`.
+     * - other string of 20 chars or more: {@see replaceUrls()}; shorter strings are unchanged.
+     * - anything else: unchanged.
+     *
+     * Output grammar: the same structure (encode it with `json_encode()`), with string leaves
+     * rewritten.
+     *
+     * Example (not lazy): `(object)['img' => 'https://example.test/a.jpg', 'n' => 1]` gives
+     * `(object)['img' => 'https://cdn.shortpixel.ai/spai/q_lossy+ret_img/example.test/a.jpg', 'n' => 1]`.
+     *
+     * @todo parse() has unreachable code after `return`: the `affectedTags.record()` call (which
+     *       also uses `.` instead of `->`). Remove it; callers already call `affectedTags->record()`.
+     *
+     * @param mixed $content Decoded JSON.
+     * @return mixed The rewritten value.
+     */
     function parse($content) {
         //return $content;
         (SHORTPIXEL_AI_DEBUG & ShortPixelAILogger::DEBUG_AREA_JSON) && $this->logger->log("******** JSON PARSER *********");
@@ -27,6 +81,12 @@ class ShortPixelJsonParser {
         }
     }
 
+    /**
+     * Recursive worker of {@see parse()}; see there for the per-node rules.
+     *
+     * @param mixed $content A JSON node.
+     * @return mixed The rewritten node.
+     */
     protected function parseRecursive($content) {
         if(is_array($content) || is_object($content) ) {
             foreach ($content as $key => $value) {
@@ -43,7 +103,7 @@ class ShortPixelJsonParser {
             return $content;
         } elseif(is_string($content)) {
             $parsed = json_decode($content);
-            if(json_last_error() !== JSON_ERROR_SYNTAX) {
+            if(json_last_error() === JSON_ERROR_NONE && (is_array($parsed) || is_object($parsed))) {
                 (SHORTPIXEL_AI_DEBUG & ShortPixelAILogger::DEBUG_AREA_JSON) && $this->logger->log("LEAF IS JSON");
                 return json_encode($this->parseRecursive($parsed));
             } else {
@@ -67,6 +127,27 @@ class ShortPixelJsonParser {
         }
     }
 
+    /**
+     * Rewrites every URL-like token of a plain string with {@see replaceUrl()}.
+     *
+     * The token regex (case-insensitive, unicode) is the "liberal URL" pattern: `http(s)://`,
+     * `wwwN.` or `domain.tld/` followed by non-space chars and balanced parentheses, not ending in
+     * punctuation. The extension filter happens in `replaceUrl()` (the stricter extension-based
+     * regex caused catastrophic backtracking). Relative paths (`/wp-content/a.jpg`) are not matched.
+     * Scheme-less tokens are: in `//example.test/a.jpg` the token is `example.test/a.jpg`.
+     *
+     * @todo replaceUrls() matches scheme-less tokens (`example.test/a.jpg` inside a
+     *       protocol-relative `//example.test/a.jpg`, or `www.example.test/a.jpg`), which
+     *       `absoluteUrl()` then resolves relative to the current page, giving a wrong CDN URL
+     *       (and `//` + CDN URL for the protocol-relative case). Include a leading `//` in the
+     *       token and prefix `www`/domain tokens with the current scheme before `absoluteUrl()`.
+     *
+     * When lazy, every non-`img` tag in the result that carries a `data:image/svg+xml;` value is
+     * added to `affectedTags` and to `$tagRule->used` with `SRC_ATTR | CSS_ATTR`.
+     *
+     * @param string $text A string leaf.
+     * @return string|null The rewritten string (null on PCRE failure; the caller then keeps the original).
+     */
     protected function replaceUrls($text) {
         (SHORTPIXEL_AI_DEBUG & ShortPixelAILogger::DEBUG_AREA_JSON) && $this->logger->log("try replace URLs in $text \n\n");
 
@@ -95,6 +176,18 @@ class ShortPixelJsonParser {
         return $ret;
     }
 
+    /**
+     * Rewrites one URL token.
+     *
+     * Unchanged when it contains `settings.behaviour.api_url`, or (after `absoluteUrl()`) its
+     * extension is not in `ShortPixelUrlTools::$PROCESSABLE_EXTENSIONS`, or it is
+     * `urlIsExcluded()` or not `isValid()`. Otherwise lazy:
+     * `generate_placeholder_svg(<get_image_size()>, $url)`; eager:
+     * `get_api_url($url, false, false, <ext>)` (no `w_` token).
+     *
+     * @param string[] $match [0] the token.
+     * @return string The replacement.
+     */
     protected function replaceUrl($match) {
         (SHORTPIXEL_AI_DEBUG & ShortPixelAILogger::DEBUG_AREA_JSON) && $this->logger->log('Matches' . json_encode($match) . "\n");
         if(strpos($match[0], $this->ctrl->settings->behaviour->api_url) === false) {

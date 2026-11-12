@@ -8,12 +8,26 @@
 	use ShortPixelUrlTools;
 	use ShortPixel\AI\Converter;
 
+	/**
+	 * AJAX endpoint of the instant LQIP mode (`shortpixel_ai_handle_lqip_action`, also `nopriv`, registered by `LQIP::hooks()`
+	 * only when `behaviour.process_way` is `instant`).
+	 */
 	class Actions {
 		/**
 		 * Method handles the pages's actions
 		 * Works via AJAX
 		 *
 		 * INSTANT LQIP only: requires  spainonce
+		 *
+		 * Nonce: action `shortpixel-ai-settings`, field `$_REQUEST['spainonce']` (`Page::checkSpaiNonce()` answers
+		 * `{success: false, message}` and dies on failure). No capability check (anonymous visitors post here).
+		 * Reads `$_POST['data']` (array); `data.action` is title-cased and dispatched to `handle<Action>( $data )`, so `collect`
+		 * goes to `handleCollect()`. Answers `wp_send_json( <result>, 200 )`; without `action` the result is `{success: false}`.
+		 * Outside AJAX it returns null.
+		 *
+		 * @return null
+		 * @todo `handle()` dispatches with `call_user_func( [ 'self', ... ] )`, which is deprecated since PHP 8.2; use `[ self::class, ... ]` / `[ __CLASS__, ... ]`.
+		 * @todo Any `data.action` other than `collect` makes `handle()` call an undefined method (TypeError on PHP 8); whitelist the actions.
 		 */
 		public static function handle() {
 			if ( ShortPixelAI::isAjax() ) {
@@ -46,7 +60,18 @@
 		 * - derives referer server-side (POST referer is ignored)
 		 * - keeps only same-site, non-excluded, processable image URLs
 		 *
-		 * @param $data
+		 * Rules, in order:
+		 * 1. `data.collection` must be a non-empty array, else `{success: false, message: 'Empty collection.'}`;
+		 * 2. more than `LQIP::BUNDLE_CAPACITY` (20) items -> `{success: false, message: 'Collection is too large.'}`;
+		 * 3. referer = `wp_get_referer()` or `$_SERVER['HTTP_REFERER']` (esc_url_raw), kept only when its host equals
+		 *    `ShortPixelDomainTools::get_site_domain()` case-insensitively, else false;
+		 * 4. per item: must be an array with non-empty trimmed `url` and `source`, both `ShortPixelUrlTools::isValid()`; both are made
+		 *    absolute; skipped when either `urlIsExcluded()`; skipped when the `url` host differs from the site domain (the `source` host
+		 *    is not checked); kept as `['url', 'source', 'referer']`;
+		 * 5. nothing kept -> `{success: false, message: 'No valid items in collection.'}`;
+		 * 6. `LQIP::_()->process()`; answers `{success: true, message, collection: <processed>}`.
+		 *
+		 * @param array|null $data `$_POST['data']` without `action`
 		 *
 		 * @return array
 		 */

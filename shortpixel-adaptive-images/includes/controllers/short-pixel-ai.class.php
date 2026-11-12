@@ -8,7 +8,72 @@
 	use ShortPixel\AI\Feedback;
 	use \ShortPixel\AI\ActiveIntegrations;
 
+/**
+ * Main SPAI controller (singleton): boots the plugin, decides whether the current request is rewritten,
+ * owns the output buffer and builds every CDN URL.
+ *
+ * Booted by `short-pixel-ai.php` on `after_setup_theme` through `ShortPixelAI::_()`. The constructor creates
+ * `ShortPixelCssParser` and `ShortPixelRegexParser` (the only HTML parser used; `ShortPixelSimpleDomParser`
+ * is never instantiated), an `AffectedTags` recorder, then calls `setup_globals()` and `setup_hooks()`.
+ * Collaborators: `Options` (settings tree `short_pixel_ai_options`), `ActiveIntegrations`, `TagRules`,
+ * `JsLoader` (vanilla or jQuery), `LQIP`, `CacheCleaner`, `ShortPixelUrlTools`, `ShortPixelDomainTools`,
+ * `Page`, `Notice`, `Feedback`, `Help`.
+ *
+ * Hooks registered (callback on this instance unless stated):
+ * - constructor: `init` -> `load_textdomain()` (prio 10, always).
+ * - `setup_hooks()`, always:
+ *   - schedules cron `spai_account_check_event` (`twicedaily`) when not scheduled; `spai_account_check_event` -> `account_check_handler()`;
+ *   - `setup_front_tests()`: `switch_theme` / `after_switch_theme` (or `after_setup_theme`) -> `enqueue_front_tests()`;
+ *   - `admin_bar_menu` -> `toolbar_sniper()` prio 998, `admin_bar_menu` -> `toolbar_top_menu()` prio 999;
+ *   - filter `wp_lazy_loading_enabled` -> `__return_false` prio 1 (WP core native lazy loading off);
+ *   - `LQIP::_( $this )` (registers the LQIP hooks, see `LQIP::hooks()`).
+ * - `setup_hooks()`, front-end (`!is_admin()` or AJAX):
+ *   - only when `is_conflict()` is not a show-stopper (`ao`, `avadalazy`, `ginger`): `wp_enqueue_scripts` -> `enqueue_script()`,
+ *     `init` -> `init_ob()` prio 1, filter `script_loader_tag` -> `disable_rocket_loader()` prio 10 (3 args);
+ *   - always: `wp_ajax_nopriv_shortpixel_deactivate_ai` -> `deactivate_ai_handler()`, `wp_ajax_nopriv_shortpixel_activate_ai` -> `activate_ai_handler()`;
+ *   - when `is_admin()` (i.e. admin-ajax.php): `wp_ajax_shortpixel_ai_add_selector_to_list` -> `add_selector_to_list()`,
+ *     `wp_ajax_shortpixel_ai_remove_selector_from_list` -> `remove_selector_from_list()`, `wp_ajax_shortpixel_deactivate_ai`,
+ *     `wp_ajax_shortpixel_activate_ai`, `wp_ajax_spai_propose_upgrade` -> `propose_upgrade()`;
+ *   - AJAX with `$_POST['data']` and an `action` starting with `shortpixel_ai`: boots `Page`, `Notice`, `Feedback`, `Help`.
+ * - `setup_hooks()`, back-end (admin, not AJAX): boots `Page`, `Notice`, `Notice\Constants`, `Feedback`, `Help`;
+ *   `setup_cache_hooks()` when `areas.parse_css_files > 0`; `admin_enqueue_scripts` -> `enqueue_admin_styles()` and
+ *   `enqueue_admin_script()`; `in_plugin_update_message-<basename>` -> `PluginUpdateNotice::in_plugin_update_message` prio 10 (2 args);
+ *   filter `plugin_action_links_<basename>` -> `generate_plugin_links()`.
+ * - `setup_hooks()`, every `is_admin()` request (admin pages and admin-ajax.php): `setup_promo_banner()` registers the
+ *   campaign banner of the `promo-banner` module (`admin_enqueue_scripts` -> its assets, `wp_ajax_spai_promo_banner_dismiss`
+ *   -> its dismissal). The settings and on-boarding templates print it with `renderPromoBanner()`.
+ * - `init_ob()` (front-end, `init` prio 1): see that method for the integration hooks and the `ob_start()`.
+ *
+ * Persistent state used:
+ * - option `spai-promo-banner` (through the `promo-banner` module): campaign id => dismissal time;
+ * - option `short_pixel_ai_options` (through `Options`): `settings.*`, `flags.all.{advanced,credits,css_ver,firstInstall,account}`,
+ *   `tests.front_end.{enqueued,missing_jquery}`, `pages.on_boarding.{hasBeenPassed,redirectAllowed}`, `notices.dismissed`;
+ * - 1.x options `spai_settings_*` (read and deleted by `migrate_options()`, written by `revert_options()`);
+ * - options read for conflicts: `autoptimize_imgopt_settings`, `autoptimize_extra_settings`, `dtb_toolbox`, `ginger_general`,
+ *   `siteground_optimizer_combine_javascript`, `fusion_options`, `elementor_css_print_method`;
+ * - cron `spai_account_check_event` (this class) and `spai_lqip_generate_event` (cleared by `deactivate()`).
+ * No transient is read or written directly by this class.
+ *
+ * Static state a test must reset: `ShortPixelAI::$instance` (private, reflection), and on the instance the public
+ * `$lazyNoticeThrown`, `$blankInlinePlaceholders`, `$exclusions` (mutated by `init_ob()` and `toolbar_sniper_bar()`) and
+ * `$settings` (mutated in memory by `init_ob()`). `pageIsExcluded()` keeps a function-static cache that survives a reset.
+ *
+ * @todo `isWelcome()`, `init_ob()` and the AJAX handlers read superglobals directly; there is no request abstraction, so tests must set `$_GET`/`$_SERVER`/`$_REQUEST`.
+ */
 class ShortPixelAI {
+    /**
+     * Remote endpoints and fixed values.
+     * - DEFAULT_MAIN_DOMAIN: shortpixel.com site (links, upgrade fragment).
+     * - DEFAULT_API_AI: CDN host; DEFAULT_API_AI_PATH is appended to form the default `settings.behaviour.api_url` `https://cdn.shortpixel.ai/spai`.
+     * - DEFAULT_STATUS_AI: host of the `read-domain*` / `add-domain` endpoints (used by ShortPixelDomainTools).
+     * - SP_API: ShortPixel API base (user-info, feedback). REMOTE_MESSAGE_ENDPOINT: remote notices feed.
+     * - PURGE_CDN_CACHE_ENDPOINT: bulk CDN purge, `<endpoint><key>/<domain>`.
+     * - AI_JS_VERSION: version part of `assets/js/ai-<ver>.js` (jQuery mode).
+     * - ONE_CREDIT_IN_TRAFFIC: bytes of CDN traffic per credit (5 MiB).
+     * - SEP: separator between CDN URL tokens.
+     * - LOG_NAME: debug log file name.
+     * - ACCOUNT_CHECK_SCHEDULE: cron event name and recurrence of the account check.
+     */
     const DEFAULT_MAIN_DOMAIN = 'https://shortpixel.com';
     const DEFAULT_API_AI = 'https://cdn.shortpixel.ai';
     const DEFAULT_STATUS_AI = 'https://cdn.shortpixel.ai';
@@ -21,7 +86,18 @@ class ShortPixelAI {
     const SEP = '+'; //can be + or ,
     const LOG_NAME = 'shortpixel-ai.log';
 	const ACCOUNT_CHECK_SCHEDULE = array( 'name' => 'spai_account_check_event', 'recurrence' => 'twicedaily', );
+	/** Prefix of the promo banner: names its dismissals option (`spai-promo-banner`), AJAX action and asset handle. */
+	const PROMO_BANNER_PREFIX = 'spai';
+    /**
+     * Conflict keys returned by `is_conflict()` that disable the front-end rewriting hooks.
+     * @var string[]
+     */
     public static $SHOW_STOPPERS = array('ao', 'avadalazy', 'ginger');
+    /**
+     * `$_REQUEST['action']` values for which `isWelcome()` returns false (media modal, editor insert,
+     * WooCommerce variations, Avia, My Listing, Oxygen, Zion builder).
+     * @var string[]
+     */
     public static $excludedAjaxActions = array(
         //Add Media popup     Image to editor              Woo product variations
         'query-attachments', 'send-attachment-to-editor', 'woocommerce_load_variations',
@@ -35,44 +111,109 @@ class ShortPixelAI {
         'znpb_render_module'
     );
 
+    /**
+     * THUMBNAIL_REGEX: matches the WordPress `-<W>x<H>.<ext>` thumbnail suffix at the end of a path (group 1 the
+     * suffix, group 2 the extension). GRAVATAR_REGEX: default `excluded_paths` rule (one `regex:` line) excluding gravatar.com.
+     */
     const THUMBNAIL_REGEX = "/(-[0-9]+x[0-9]+)\.([a-zA-Z0-9]+)$/";
 	const GRAVATAR_REGEX = "regex:/\/\/([^\/]*\.|)gravatar.com\//";
 
+	/**
+	 * Options controller (magic `settings_<category>_<camelName>` accessors).
+	 * @var \ShortPixel\AI\Options
+	 */
 	public $options;
+	/**
+	 * Snapshot of `Options::_()->settings` taken in the constructor (categories `compression`, `behaviour`, `areas`,
+	 * `exclusions`). `init_ob()` appends integration rules to `exclusions.excluded_paths` on this object in memory only.
+	 * @var object
+	 */
 	public $settings;
+    /**
+     * Exclusion lists split into arrays, built by `getExclusionsMap()`.
+     * @var object{excluded_selectors: string[], eager_selectors: string[], noresize_selectors: string[], excluded_paths: string[], eager_paths: string[], excluded_pages: string[]}
+     */
     public $exclusions;
 
+    /**
+     * CSS cache version `flags.all.css_ver`, set only when `areas.parse_css_files > 0` (emitted as the `v_` token).
+     * @var int|null
+     */
     public $cssCacheVer;
 
+    /**
+     * Set by the parsers once the "lazy loading by another plugin" notice is raised for this request.
+     * @var bool
+     */
     public $lazyNoticeThrown = false;
+    /**
+     * Recorder of tags seen in AJAX/JSON content (persisted to `spai_settings_lazy_ajax_tags`).
+     * @var \ShortPixel\AI\AffectedTags
+     */
     public $affectedTags;
 
+    /**
+     * Blank inline placeholders waiting for an LQIP, keyed by image URL; values `['source' => url, 'url' => absolute url,
+     * 'referer' => false]`. Filled by `ShortPixelUrlTools::generate_placeholder_svg()`, consumed by `maybe_replace_images_src()`.
+     * @var array<string, array>
+     */
     public $blankInlinePlaceholders = [];
 
     /**
-     * @var $instance
+     * Plugin main file (`SHORTPIXEL_AI_PLUGIN_FILE`).
+     * @var string
      */
     private $file;
+    /** @var string plugin_basename() of the main file. */
     public $basename;
+    /** @var string Plugin directory path with trailing slash. */
     public $plugin_dir;
+    /** @var string Plugin directory URL with trailing slash. */
     public $plugin_url;
 
+    /** @var \ShortPixel\AI\PromoBanner\PromoBanner|null The current campaign banner, set by `setup_promo_banner()`; printed by `renderPromoBanner()`. */
+    protected $promoBanner = null;
+
+    /**
+     * Singleton instance.
+     * @var ShortPixelAI
+     */
     private static $instance;
+    /** @var bool Result of `isAjax()` captured in the constructor. */
     private $doingAjax = false;
 
+    /** @var string|false Last conflict key computed by `is_conflict()`; false before the first call. */
     private $conflict = false;
+    /** @var bool True when `JsLoader::check()` fails on a non-AJAX buffer (SPAI script dequeued): HTML is then left untouched. */
     private $spaiJSDequeued = false;
 
+    /** @var \ShortPixelAILogger */
     private $logger = false;
+    /** @var ShortPixelRegexParser */
     private $parser = false;
+    /** @var ShortPixelCssParser */
     private $cssParser = false;
 
+    /**
+     * Unused.
+     * @var bool
+     * @todo `$domainStatus` and `$cdnUsage` are never read or written; remove them.
+     */
     private $domainStatus = false;
+    /** @var bool Unused, see `$domainStatus`. */
     private $cdnUsage = false;
 
+    /**
+     * True when the CDN can serve different formats on one URL (`Vary: Accept`): `compression.webp_detect` is off or
+     * `behaviour.api_url` is on `cdn.shortpixel.ai`. Gates the `to_` token in `get_api_url()` and the vanilla `convert` mode.
+     * Computed from the unfiltered `api_url`, not from `get_cdn_url()`.
+     * @var bool
+     */
     public $varyCacheSupport = false;
 
     /**
+     * Returns the HTML parser created in the constructor.
+     *
      * @return ShortPixelRegexParser
      */
     public function getRegexParser() {
@@ -80,6 +221,8 @@ class ShortPixelAI {
     }
 
     /**
+     * Returns the CSS parser created in the constructor.
+     *
      * @return bool|ShortPixelCssParser
      */
     public function getCssParser()
@@ -87,15 +230,25 @@ class ShortPixelAI {
         return $this->cssParser;
     }
 
+	/**
+	 * Tells whether the request is an admin-ajax request.
+	 *
+	 * Uses `wp_doing_ajax()` when available, else the `DOING_AJAX` constant.
+	 *
+	 * @return bool
+	 * @todo The `function_exists( 'wp_doing_ajax' )` fallback targets WordPress < 4.7 and is dead code.
+	 */
 	public static function isAjax() {
 		return function_exists( 'wp_doing_ajax' ) ? wp_doing_ajax() : defined( 'DOING_AJAX' ) && DOING_AJAX;
 	}
 
 	/**
-	 * Method checks is user logged in and has capability
+	 * Tells whether a user exists and has a capability.
 	 *
-	 * @param string            $capability WP user capabilities
-	 * @param \WP_User|int|null $user       if null would be used current user ID
+	 * `$user` may be a `WP_User`, a positive user ID, or null for the current user. Returns false for anonymous users.
+	 *
+	 * @param string            $capability WP user capability
+	 * @param \WP_User|int|null $user       User object or ID; null uses the current user
 	 *
 	 * @return bool
 	 */
@@ -110,7 +263,11 @@ class ShortPixelAI {
 	}
 
     /**
-     * Make sure only one instance is running.
+     * Returns the singleton, constructing it (and registering all hooks) on first call.
+     *
+     * Tests reset it by setting the private static `$instance` to null through reflection.
+     *
+     * @return ShortPixelAI
      */
 	public static function _() {
 		if ( !isset ( self::$instance ) ) {
@@ -120,6 +277,10 @@ class ShortPixelAI {
 		return self::$instance;
 	}
 
+    /**
+     * Registers `init` -> `load_textdomain()`, loads the options and the exclusions map, creates the CSS and regex
+     * parsers and the AffectedTags recorder, captures `isAjax()`, then runs `setup_globals()`, `include_libs()` and `setup_hooks()`.
+     */
     private function __construct() {
         add_action( 'init', [ $this, 'load_textdomain' ] );
 
@@ -145,10 +306,44 @@ class ShortPixelAI {
         $this->setup_hooks();
     }
 
+    /**
+     * Loads the `shortpixel-adaptive-images` text domain from the plugin's `lang/` directory (hooked on `init`).
+     *
+     * @return void
+     */
     public function load_textdomain() {
         load_plugin_textdomain('shortpixel-adaptive-images', false, plugin_basename(dirname(SHORTPIXEL_AI_PLUGIN_FILE)) . '/lang');
     }
 
+    /**
+     * Starts the rewriting output buffer for the request (hooked on `init` prio 1, front-end only).
+     *
+     * When `isWelcome()` is true it registers, in this order:
+     * - filter `wp_calculate_image_srcset` -> `replace_image_srcset()` prio 10, 5 args;
+     * - Elementor active, jQuery mode (`behaviour.nojquery <= 0`) and option `elementor_css_print_method === 'external'`:
+     *   action `elementor/element/parse_css` -> `parse_elementor_css()` prio 10, 2 args;
+     * - NextGen active: filter `ngg_pro_lightbox_images_queue` -> `parseNextGenEntities()`;
+     * - `areas.parse_css_files > 0` and WP Rocket `minify-css` and `css-filter` (>= 3.4.3): filter `rocket_css_content` -> `parse_cached_css()` prio 10, 3 args;
+     * - `parse_css_files > 0` and WP Fastest Cache: `wpfc_css_content` -> `parse_cached_css()`;
+     * - `parse_css_files > 0` and W3 Total Cache: `w3tc_minify_css_content` -> `parse_cached_css()`;
+     * - `parse_css_files > 0` and WP-Optimize with `enable_css`: `wpo_minify_get_css` -> `parse_cached_css_wpo()` prio 10, 3 args;
+     * - `parse_css_files > 0` and LiteSpeed Cache: `litespeed_css_serve` (4 args) and `litespeed_optm_cssjs` (3 args) -> `parse_cached_css()`;
+     * - appends to `$this->settings->exclusions->excluded_paths` (in memory): `path:/revslider/public/assets/assets/transparent.png`
+     *   (Slider Revolution), `path:/custom-facebook-feed-pro/img/placeholder.png` (Custom Facebook Feed),
+     *   `path:/smart-cookie-kit/res/empty.gif` (Smart Cookie Kit), `path://i.ytimg.com/vi/ID/hqdefault.jpg` (WP Rocket video placeholder);
+     * - appends to `$this->exclusions`: `domain:cdninstagram.com` to `excluded_paths` (Instagram Feed, Insta Gallery, Essential Grid),
+     *   `img[data-mk-image-src-set]` to `eager_selectors` (Jupiter theme), `img[data-perfmatters-preload]` to `eager_selectors` (Perfmatters);
+     * - `parse_css_files > 0` and Swift Performance Pro with `merge_styles`: closures on `swift_performance_critical_css_content`
+     *   (1 arg) and `swift_performance_css_content` (2 args), both running `parse_cached_css()`;
+     * - filter `wp` -> `disableRocketLazy()` prio 1;
+     * - `ob_start( [ $this, 'maybe_replace_images_src' ] )`.
+     * Otherwise, when `SHORTPIXEL_AI_CLEANUP` is defined: `ob_start( [ $this, 'maybe_cleanup' ] )`; else nothing.
+     *
+     * @return void
+     * @todo `init_ob()` adds `domain:cdninstagram.com` to `$this->exclusions->excluded_paths`, but `urlIs()`/`isExcluded()` read
+     *       `$this->settings->exclusions->excluded_paths`, so the Instagram exclusion never applies. Append it to the settings string like the other path rules.
+     * @todo The Jupiter and Perfmatters eager selectors go only to `$this->exclusions` (server-side `tagIs()`); the JS loaders read the settings strings, so the front-end JS never receives them.
+     */
     public function init_ob() {
         if ($this->isWelcome()) {
             SHORTPIXEL_AI_DEBUG && $this->logger->log('WILL PARSE ' . $_SERVER['REQUEST_URI'] . ' CALLED BY ' . @$_SERVER['HTTP_REFERER']
@@ -240,6 +435,11 @@ class ShortPixelAI {
 		        $this->settings->areas->parse_css_files > 0 && !empty( $swiftPerf ) && !empty( $swiftPerf[ 'merge_styles' ] )
 		        && isset( $swiftPerf[ 'plugin' ] ) && $swiftPerf[ 'plugin' ] === 'pro'
 	        ) {
+		        /**
+		         * Rewrites background URLs in Swift Performance's critical CSS through `parse_cached_css()`.
+		         * @param string $critical_css
+		         * @return string
+		         */
 		        add_filter( 'swift_performance_critical_css_content', function( $critical_css ) {
 			        $this->logger->log( 'SWIFT PERFORMANCE (CRITICAL) CSS FILTER' );
 
@@ -249,6 +449,12 @@ class ShortPixelAI {
 			        return $critical_css;
 		        }, 10, 1 );
 
+		        /**
+		         * Rewrites background URLs in Swift Performance's merged CSS through `parse_cached_css()`.
+		         * @param string $css_content
+		         * @param string $key Swift cache key (unused)
+		         * @return string
+		         */
 		        add_filter( 'swift_performance_css_content', function( $css_content, $key ) {
 			        $this->logger->log( 'SWIFT PERFORMANCE (REGULAR) CSS FILTER' );
 
@@ -273,19 +479,26 @@ class ShortPixelAI {
     }
 
 	/**
-	 * Method adds filter do_rocket_lazyload to disable the WP Rocket's lazy loading
+	 * Disables WP Rocket's lazy loading by adding `do_rocket_lazyload` -> `__return_false` prio 1 (hooked on `wp` prio 1 by `init_ob()`).
+	 *
 	 * @since 1.8.1
+	 * @return void
 	 */
 	public function disableRocketLazy() {
 		add_filter( 'do_rocket_lazyload', '__return_false', 1 );
 	}
 
 	/**
-	 * Method parses NextGen Gallery Entities to replace image URLs with placeholders
+	 * Replaces NextGen Pro lightbox image URLs with SVG placeholders (filter `ngg_pro_lightbox_images_queue`).
 	 *
-	 * @param array $entities
+	 * For each entity it replaces `image`, `full_image`, `thumb`, `srcsets.hdpi`, `srcsets.original`, `full_srcsets.hdpi`
+	 * and `full_srcsets.original` with `ShortPixelUrlTools::generate_placeholder_svg( w, h, url )`, the size coming from
+	 * `ShortPixelUrlTools::get_image_size()`. Non-array input returns an empty array.
 	 *
-	 * @return array
+	 * @param array $entities NextGen entity arrays
+	 *
+	 * @return array Entities with placeholder URLs
+	 * @todo Missing keys in an entity (e.g. no `full_srcsets`) raise undefined-index warnings in `parseNextGenEntities()`; guard each key with isset().
 	 */
 	public function parseNextGenEntities( $entities ) {
 		$return        = [];
@@ -330,7 +543,10 @@ class ShortPixelAI {
 	}
 
 	/**
-	 * Method regenerates Elementor's CSS files for posts
+	 * Clears Elementor's generated CSS files through `Elementor\Core\Files\Manager::clear_cache()` when available.
+	 *
+	 * @return void
+	 * @todo `regenerateElementorsCSS()` has no caller in the plugin; remove it or wire it to the CSS cache clear.
 	 */
 	public function regenerateElementorsCSS() {
 		if ( class_exists( 'Elementor\Core\Files\Manager' ) ) {
@@ -343,10 +559,21 @@ class ShortPixelAI {
 	}
 
 	/**
-	 * Method integrates SPAI with Elementor's CSS Print method
+	 * Rewrites `background-image: url(...)` rules of an Elementor element into CDN URLs (action `elementor/element/parse_css`,
+	 * registered by `init_ob()` only in jQuery mode with Elementor's external CSS print method).
+	 *
+	 * With `SPAI_ELEMENTOR_WORKAROUND` defined it skips the element classes `Elementor\Widget_Image`, `Widget_Heading`,
+	 * `ElementorPro\...\Global_Widget`, `Widget_Spacer`, `Element_Column`, `Element_Section`. For every device rule whose selector
+	 * contains the element's unique selector and has `background-image`, each `url()` is replaced by
+	 * `get_api_url( false, false )` (or the `svg` only-store variant for ONLY_STORE extensions) + `/` + the absolute URL
+	 * **including the scheme** (no `w_` token: `<base>/q_<level>+ret_img[...]/https://host/path`), then re-added with `add_rules()`.
+	 * The selector test is `strpos( $selector, $element_selector )`, so a rule whose selector starts with the element selector (offset 0) is skipped.
 	 *
 	 * @param \Elementor\Core\DynamicTags\Dynamic_CSS $post_css
 	 * @param \Elementor\Element_Base                 $element
+	 *
+	 * @return void
+	 * @todo `parse_elementor_css()` appends the origin with its scheme (`/https://host/...`) while `get_api_url()` strips it; use `get_api_url( $url, false )` for one grammar.
 	 */
 	public function parse_elementor_css( $post_css, $element ) {
 		try {
@@ -456,10 +683,36 @@ class ShortPixelAI {
 		}
 	}
 
+	/**
+	 * Empty placeholder kept for library includes (all files are required by `short-pixel-ai.php`).
+	 *
+	 * @return void
+	 */
 	private function include_libs() {
 		// libs to be included
 	}
 
+	/**
+	 * Sets paths and writes missing setting defaults into `short_pixel_ai_options` (each assignment persists).
+	 *
+	 * Sets `$file`, `$basename`, `$plugin_dir`, `$plugin_url`. Defaults, in order:
+	 * - `behaviour.api_url` missing (new install): `api_url` = `https://cdn.shortpixel.ai/spai`, `amazon_s3` = false,
+	 *   `replace_method` = `src`, `fadein` = true, `compression.webp` = true, `png_to_webp`/`jpg_to_webp`/`gif_to_webp` = true,
+	 *   `areas.serve_svg` = true, `exclusions.excluded_paths` = GRAVATAR_REGEX, `behaviour.sizespostmeta` = false,
+	 *   `exclusions.excluded_pages` = '', `flags.all.advanced` = false, `behaviour.nojquery` = 2 (vanilla JS);
+	 *   otherwise `flags.all.advanced` = true when missing (existing install);
+	 * - `behaviour.sizespostmeta` missing: true;
+	 * - `areas.backgrounds_lazy` missing: `backgrounds_lazy` = false and `compression.remove_exif` = true;
+	 * - `areas.backgrounds_lazy_style` missing: copied from `backgrounds_lazy`;
+	 * - `exclusions.excluded_paths` missing: GRAVATAR_REGEX; `exclusions.excluded_pages` missing: '';
+	 * - `exclusions.eager_selectors` missing and `noresize_selectors` non-empty: copied from `noresize_selectors`;
+	 * - `tests.front_end.enqueued` not a bool: true;
+	 * - `behaviour.alter2wh` null: 0 on first install (`flags.all.firstInstall`), else 1;
+	 * - `behaviour.topbarmenu` null: true.
+	 * Then `$cssCacheVer` = `flags.all.css_ver` (default 0) when `parse_css_files > 0`, and `$varyCacheSupport` is computed.
+	 *
+	 * @return void
+	 */
 	private function setup_globals() {
 		$this->file        = SHORTPIXEL_AI_PLUGIN_FILE;
 		$this->basename    = plugin_basename( $this->file );
@@ -545,6 +798,62 @@ class ShortPixelAI {
                                || (strpos($this->options->settings->behaviour->api_url, self::DEFAULT_API_AI) !== false);
     }
 
+    /**
+     * Creates and registers the campaign banner (`promo-banner` module, bundled in `build/shortpixel/`).
+     *
+     * The banner shows on the plugin's own pages only, the settings page and the on-boarding wizard, inside the
+     * campaign window, to users with `manage_options`, until one of them dismisses it (see the module's class
+     * docblock for every condition and filter; its hooks carry this plugin's prefix, e.g.
+     * `shortpixel/ai/promo_banner/show`). With `hook` false the module prints nothing by itself: the two page
+     * templates call `renderPromoBanner()` right under their header, so the banner takes the page's width and
+     * WordPress does not move it like an admin notice.
+     *
+     * @return void
+     */
+    private function setup_promo_banner() {
+        $this->promoBanner = new \ShortPixel\AI\PromoBanner\PromoBanner( array(
+            'id'         => 'black-friday-2026',
+            'start'      => strtotime( '2026-11-23 00:00:00 UTC' ),
+            'end'        => strtotime( '2026-12-01 07:59:59 UTC' ), // 23:59:59 US Pacific on the 30th
+            'ends_on'    => '2026-11-30',                           // the day the banner prints
+            'url'        => 'https://shortpixel.com/pricing?utm_source=plugin&utm_medium=spai&utm_campaign=top_banner_bf2026',
+            'prefix'     => self::PROMO_BANNER_PREFIX,              // the plugin's identity: option, AJAX action, asset handle
+            'assets_url' => $this->plugin_url . 'build/shortpixel/promo-banner/assets/',
+            'version'    => SHORTPIXEL_AI_VERSION,
+            'screens'    => array(),
+            'condition'  => static function () {
+                return Page::isCurrent( 'settings' ) || Page::isCurrent( 'on-boarding' );
+            },
+            'capability' => 'manage_options',
+            'hook'       => false,
+        ) );
+        $this->promoBanner->register();
+    }
+
+    /**
+     * Prints the promo banner when it should show.
+     *
+     * Called by the settings and on-boarding templates right under their header. Prints nothing outside the
+     * campaign window, for users without the capability, after a dismissal, on any other screen, or when the
+     * banner was not set up (front-end requests).
+     *
+     * @return void
+     */
+    public function renderPromoBanner() {
+        if ( is_object( $this->promoBanner ) ) {
+            $this->promoBanner->render();
+        }
+    }
+
+    /**
+     * Schedules the account check and registers the hooks listed in the class docblock (common, front-end, back-end branches).
+     *
+     * The front-end branch runs when `!is_admin()` or during AJAX; it calls `is_conflict()` and skips the rewriting hooks on a show-stopper.
+     *
+     * @return void
+     * @todo `setup_hooks()` registers `setup_cache_hooks()` only in the back-end branch, so a cache purge triggered from the
+     *       front-end, admin-ajax or WP-Cron (`!is_admin() || doingAjax`) does not bump `css_ver`. Register the cache hooks in both branches.
+     */
     private function setup_hooks() {
 	    // has event not already been scheduled?
 		if ( !wp_next_scheduled( self::ACCOUNT_CHECK_SCHEDULE[ 'name' ] ) ) {
@@ -566,6 +875,11 @@ class ShortPixelAI {
 	    add_filter( 'wp_lazy_loading_enabled', '__return_false', 1 );
 
         LQIP::_( $this );
+
+        // Admin pages and admin-ajax.php (the banner's dismissal is an AJAX call).
+        if ( is_admin() ) {
+            $this->setup_promo_banner();
+        }
 
         //if(!(is_admin() && !wp_doing_ajax() /* && function_exists("is_user_logged_in") && is_user_logged_in() */)) {
         if (!is_admin() || $this->doingAjax) {
@@ -625,6 +939,15 @@ class ShortPixelAI {
         }
     }
 
+    /**
+     * Hooks `enqueue_front_tests()` so the front-end JS self-test is re-enabled after a theme change.
+     *
+     * `has_action()` without a callback tells whether any callback is already attached: `switch_theme` and
+     * `after_switch_theme` (else `after_setup_theme`) are used only if something already listens; when none do,
+     * `enqueue_front_tests()` runs immediately on this request.
+     *
+     * @return void
+     */
     private function setup_front_tests() {
         /**
          * When current theme has been changed/deactivated this hook fired
@@ -654,6 +977,13 @@ class ShortPixelAI {
 
     }
 
+    /**
+     * Hooks `clear_css_cache()` (bumps `flags.all.css_ver`) to the "clear all" actions of active cache plugins:
+     * Swift `swift_performance_before_clear_all_cache`, W3TC `w3tc_flush_all`, WP Fastest Cache `wpfc_delete_cache`,
+     * WP Super Cache `wp_cache_cleared`, LiteSpeed `litespeed_purged_all_cssjs`, WP Rocket `before_rocket_clean_minify`.
+     *
+     * @return void
+     */
     private function setup_cache_hooks() {
 	    $integrations = ActiveIntegrations::_();
 	    if($integrations->has('swift-performance')) {
@@ -676,6 +1006,13 @@ class ShortPixelAI {
         }
     }
 
+	/**
+	 * Cron handler of `spai_account_check_event`: refreshes the domain status (`ShortPixelDomainTools::get_domain_status( true )`)
+	 * and, when `Status` is 2 or 0 (has credits), removes the `credits` notice dismissal so the notice can show again later.
+	 *
+	 * @return void
+	 * @todo `account_check_handler()` reads `$domain_response->Status` without checking that the response is an object with that property.
+	 */
 	public function account_check_handler() {
 		$domain_response   = ShortPixelDomainTools::get_domain_status( true );
 		$domain_status     = (int) $domain_response->Status === 2 || (int) $domain_response->Status === 0;
@@ -686,18 +1023,47 @@ class ShortPixelAI {
 		}
 	}
 
+	/**
+	 * Sets `tests.front_end.enqueued` = true so the jQuery-mode front-end self-test (`ai.tests.js`) is enqueued for admins.
+	 *
+	 * @return bool
+	 */
 	public function enqueue_front_tests() {
 		return !!$this->options->set( true, 'enqueued', [ 'tests', 'front_end' ] );
 	}
 
+	/**
+	 * AJAX `shortpixel_deactivate_ai` (+ `nopriv`): marks jQuery as missing. See `change_ai_handler()`.
+	 *
+	 * @return bool|void
+	 */
 	public function deactivate_ai_handler() {
         return $this->change_ai_handler(true);
 	}
 
+	/**
+	 * AJAX `shortpixel_activate_ai` (+ `nopriv`): clears the missing-jQuery flag. See `change_ai_handler()`.
+	 *
+	 * @return bool|void
+	 */
 	public function activate_ai_handler() {
         return $this->change_ai_handler(false);
 	}
 
+    /**
+     * Shared body of the (de)activate handlers, sent by the jQuery self-test.
+     *
+     * Capability: `manage_options` (403 otherwise, so the `nopriv` registrations always fail). Nonce: action
+     * `spai-ajax-nonce`, field `$_REQUEST['spainonce']` (403 on failure). On success sets `tests.front_end.enqueued` = false
+     * and `tests.front_end.missing_jquery` = `$deactivate`, and answers `{success, front: {reload: true}}` with 200.
+     * In AJAX it ends with `wp_send_json()`; otherwise it returns `success`.
+     *
+     * @param bool $deactivate true marks jQuery as missing (disables jQuery-mode rewriting in `isWelcome()`)
+     *
+     * @return bool|void
+     * @todo The nonce action `spai-ajax-nonce` is never created anywhere (`wp_create_nonce`), so `change_ai_handler()` always answers 403
+     *       and the self-test cannot switch the flag. Create the nonce for the self-test script or verify `shortpixel-ai-settings`.
+     */
     protected function change_ai_handler($deactivate) {
         $httpCode = 403;
         if(!self::userCan( 'manage_options' )) {
@@ -723,6 +1089,17 @@ class ShortPixelAI {
         }
     }
 
+    /**
+     * AJAX `spai_propose_upgrade`: prints the upgrade proposal fragment for the stored API key.
+     *
+     * Nonce: action `ajax_request`, field `$_POST['nonce']` (created in `Notice` for the propose-upgrade shade). No capability
+     * check. On a bad nonce it echoes a message and returns (admin-ajax then appends `0`); otherwise
+     * `ShortPixelDomainTools::propose_upgrade()` echoes the remote body and `die()`s.
+     *
+     * @return void
+     * @todo `propose_upgrade()` performs no capability check; add `userCan( 'manage_options' )`.
+     * @todo `propose_upgrade()` reads `$_POST['nonce']` without isset() (warning when absent) and does not `wp_die()` after the error message.
+     */
     public function propose_upgrade() {
 
         if (! wp_verify_nonce($_POST['nonce'], 'ajax_request')) {
@@ -733,11 +1110,12 @@ class ShortPixelAI {
     }
 
 	/**
-	 * Method returns queried WP dependencies
+	 * Returns the registered dependency objects of the enqueued scripts or styles.
 	 *
-	 * @param string $type
+	 * @param string $type `styles` or `scripts` (anything else means scripts)
 	 *
 	 * @return \_WP_Dependency[]
+	 * @todo `get_queried_dependencies()` has no caller in the plugin.
 	 */
 	public function get_queried_dependencies( $type = 'scripts' ) {
 		switch ( $type ) {
@@ -766,9 +1144,11 @@ class ShortPixelAI {
 	}
 
 	/**
-	 * Method returns user's logged in token
+	 * Returns the current user's session token (`wp_get_session_token()`, else the `logged_in` cookie token, else '').
+	 * Compared with the token stored for the on-boarding front worker in `JsLoader::enqueue()`.
 	 *
 	 * @return string
+	 * @todo The `function_exists( 'wp_get_session_token' )` fallback targets WordPress < 4.0 and is dead code.
 	 */
 	public function get_user_token() {
 		if ( function_exists( 'wp_get_session_token' ) ) {
@@ -780,6 +1160,16 @@ class ShortPixelAI {
 		return !empty( $cookie[ 'token' ] ) ? $cookie[ 'token' ] : '';
 	}
 
+    /**
+     * Adds the admin bar node `shortpixel_ai_sniper` holding the image-checker ("sniper") markup.
+     *
+     * Skipped for users without `manage_options`, or when `tests.front_end.missing_jquery` is set in jQuery mode.
+     * Appends `img.spai-snip-loader-img` to `$this->exclusions->excluded_selectors` so the spinner is not rewritten.
+     *
+     * @param \WP_Admin_Bar $wp_admin_bar
+     *
+     * @return void
+     */
     public function toolbar_sniper_bar($wp_admin_bar) {
 		//                                                TODO: missing_jquery check should be removed after sniper will migrate to VanillaJS
 	    if ( !self::userCan( 'manage_options' ) || !!$this->options->tests_frontEnd_missingJquery && ($this->options->settings_behaviour_nojquery <= 0)
@@ -841,12 +1231,28 @@ class ShortPixelAI {
         $this->logger->log('TOOLBAR SNIPER MARKUP ADDED.');
     }
 
+    /**
+     * Enqueues the sniper assets for admins on the front-end: style `spai-bar-style` (`style-bar.css`) and script `spai-sniper`
+     * from `https://<CDN host>/assets/js/snip-3.1.min.js` (host `dev.shortpixel.ai` when `SHORTPIXEL_AI_DEBUG`), version
+     * `SPAI_SNIP_VERSION`, localized as `sniperLocalization` (`ajaxNonce`, `sizes`, `messages.static`, `messages.dynamic`), with the CSP nonce applied.
+     *
+     * `ajaxNonce` is the settings nonce (`Page::getNonce()`, action `shortpixel-ai-settings`). The bundle is served by the CDN and
+     * posts `shortpixel_ai_add_selector_to_list` / `shortpixel_ai_remove_selector_from_list` without a nonce, while
+     * `can_manage_settings_ajax()` requires one, so an inline script printed after the bundle registers a `jQuery.ajaxPrefilter`
+     * that appends `&spainonce=<ajaxNonce>` to the string data of exactly these two actions (any other request is left alone).
+     * The prefilter is installed once per page (flag `window.spaiSniperNonce`): at once when jQuery is already there, otherwise
+     * from a capture-phase `load` listener on `document`, which sees the jQuery copy the bundle injects on a page without jQuery
+     * before that script's own `onload` starts the sniper. Only requests sent through `jQuery.ajax()` get the nonce.
+     *
+     * @return void
+     */
     public function toolbar_sniper_scripts() {
         $this->enqueue_style('spai-bar-style', 'style-bar', false, true);
 
         wp_register_script( 'spai-sniper', 'https://' . (SHORTPIXEL_AI_DEBUG ? 'dev.shortpixel.ai' : parse_url($this->get_cdn_url(), PHP_URL_HOST)) . '/assets/js/snip-3.1.min.js', [], SPAI_SNIP_VERSION, true );
 
         wp_localize_script( 'spai-sniper', 'sniperLocalization', [
+            'ajaxNonce' => Page::_( $this )->getNonce(),
             'sizes'    => (object) [
                 'gb'    => __( 'GB', 'shortpixel-adaptive-images' ),
                 'mb'    => __( 'MB', 'shortpixel-adaptive-images' ),
@@ -905,11 +1311,39 @@ class ShortPixelAI {
                 ],
             ],
         ] );
+        // The CDN bundle posts the selector actions without `spainonce`: add it (jQuery may be loaded later by the bundle itself).
+        wp_add_inline_script( 'spai-sniper', <<<'JS'
+(function () {
+	function install() {
+		if (window.spaiSniperNonce || !window.jQuery) {
+			return;
+		}
+		window.spaiSniperNonce = true;
+		jQuery.ajaxPrefilter(function (options) {
+			if (typeof options.data === 'string'
+				&& /(^|&)action=shortpixel_ai_(add_selector_to|remove_selector_from)_list(&|$)/.test(options.data)) {
+				options.data += '&spainonce=' + encodeURIComponent(sniperLocalization.ajaxNonce);
+			}
+		});
+	}
+	install();
+	// Catches the jQuery copy the sniper injects on pages without jQuery (capture phase, before its onload).
+	document.addEventListener('load', install, true);
+})();
+JS
+        );
         \ShortPixelUrlTools::applyNonce('spai-sniper');
 
         wp_enqueue_script( 'spai-sniper');
     }
 
+    /**
+     * Prepends a "Settings" link (`options-general.php?page=shortpixel-ai-settings`) to the plugin row actions.
+     *
+     * @param string[] $links
+     *
+     * @return string[]
+     */
     public function generate_plugin_links($links)
     {
 	    $in = '<a href="options-general.php?page=' . Page::NAMES[ 'settings' ] . '">' . __( 'Settings' ) . '</a>';
@@ -917,6 +1351,15 @@ class ShortPixelAI {
         return $links;
     }
 
+    /**
+     * Adds `data-cfasync="false"` to the `<script>` tag of any handle containing `spai-scripts` so Cloudflare Rocket Loader skips it.
+     *
+     * @param string $tag    Script tag HTML
+     * @param string $handle Script handle
+     * @param string $src    Script URL (unused)
+     *
+     * @return string
+     */
     function disable_rocket_loader( $tag, $handle, $src ) {
         if ( strpos($handle, 'spai-scripts') !== false ) {
             //$tag = str_replace( 'src=', 'data-cfasync="false" src=', $tag );
@@ -925,6 +1368,18 @@ class ShortPixelAI {
         return $tag;
     }
 
+    /**
+     * Rewrites `url()` references of a cache plugin's minified CSS (WP Rocket, WP Fastest Cache, W3TC, LiteSpeed, Swift).
+     *
+     * Sets `ShortPixelCssParser::$cssFilePath` to the directory of `$target` (relative URLs resolve against it), runs
+     * `replace_inline_style_backgrounds()`, then resets the path.
+     *
+     * @param string       $content CSS
+     * @param string|false $source  Source path/URL (logged only)
+     * @param string|false $target  Target file path/URL, used as base for relative URLs
+     *
+     * @return string
+     */
     function parse_cached_css($content, $source = false, $target = false) {
         $this->cssParser->cssFilePath = $target ? trailingslashit(dirname($target)) : false;
         $ret = $this->cssParser->replace_inline_style_backgrounds($content);
@@ -935,6 +1390,15 @@ class ShortPixelAI {
         return $ret;
     }
 
+    /**
+     * WP-Optimize variant of `parse_cached_css()` (filter `wpo_minify_get_css`): relative URLs resolve against `dirname( $url )`.
+     *
+     * @param string $content CSS
+     * @param string $url     URL of the CSS file
+     * @param mixed  $minify  WP-Optimize minify flag (unused)
+     *
+     * @return string
+     */
     function parse_cached_css_wpo($content, $url, $minify) {
         $this->cssParser->cssFilePath = trailingslashit(dirname($url));
         $ret = $this->cssParser->replace_inline_style_backgrounds($content);
@@ -944,6 +1408,12 @@ class ShortPixelAI {
         return $ret;
     }
 
+    /**
+     * Front-end `wp_enqueue_scripts`: when `isWelcome()`, adds the loader's fade-in CSS (`behaviour.fadein` and not `lqip`),
+     * calls `JsLoader::_( $this )->enqueue()`, and for `manage_options` users enqueues `spai-admin-styles` and the sniper scripts.
+     *
+     * @return void
+     */
     public function enqueue_script() {
         if ( $this->isWelcome() )
         {
@@ -963,6 +1433,17 @@ class ShortPixelAI {
     }
 
     //TODO refactor
+    /**
+     * Splits a settings list into trimmed items.
+     *
+     * Newlines are first converted to `$delimiter` (unless the delimiter is "\n"), so comma lists may also be one per line.
+     * Non-strings return []; an empty string returns []. Empty items (e.g. from ",,") are kept as ''.
+     *
+     * @param string|mixed $selectors Raw list
+     * @param string       $delimiter `,` for selectors, "\n" or PHP_EOL for paths/pages
+     *
+     * @return string[]
+     */
     public function splitSelectors($selectors, $delimiter) {
         if(!is_string($selectors)) {
             return [];
@@ -974,12 +1455,32 @@ class ShortPixelAI {
         return array_map('trim', $selArray);
     }
 
+    /**
+     * `admin_bar_menu` prio 998: on the front-end, when `isWelcome()` and the user has `manage_options`, adds the sniper node.
+     *
+     * @param \WP_Admin_Bar $wp_admin_bar
+     *
+     * @return void
+     */
     public function toolbar_sniper($wp_admin_bar) {
         if (!is_admin() && $this->isWelcome() && self::userCan( 'manage_options' )) {
             $this->logger->log('TOOLBAR SNIPER ON');
             $this->toolbar_sniper_bar($wp_admin_bar);
         }
     }
+	/**
+	 * `admin_bar_menu` prio 999: adds the `shortpixel_ai_topmenu` node and enqueues `topbar-menu.js`.
+	 *
+	 * Requires `manage_options`, `behaviour.topbarmenu`, and on-boarding passed (or a front-end request). Children, all needing
+	 * on-boarding passed except the sniper: `spai_top_menu_clear_css_cache` (`parse_css_files > 0`, `spaiCssCacheClear()`),
+	 * `spai_top_menu_purge_cdn_cache` (`spaiCdnCachePurge()`), `spai_top_menu_clear_lqip_cache` (`behaviour.lqip`, `spaiLqipCacheClear()`),
+	 * `spai_top_menu_sniper` (front-end and `isWelcome()`, `spaiSniperClick()`), `spai_top_menu_settings` (settings page link).
+	 * The JS calls receive the `shortpixel-ai-settings` nonce from `Page::getNonce()`.
+	 *
+	 * @param \WP_Admin_Bar $wp_admin_bar
+	 *
+	 * @return void
+	 */
 	public function toolbar_top_menu($wp_admin_bar) {
 
 		if (   self::userCan( 'manage_options' )
@@ -1056,6 +1557,11 @@ class ShortPixelAI {
 		}
 	}
 
+	/**
+	 * `admin_enqueue_scripts`: enqueues `spai-admin-styles` on every admin page, plus the tippy styles on the settings and on-boarding pages.
+	 *
+	 * @return void
+	 */
 	public function enqueue_admin_styles() {
 		// Registering the styles
 		//TODO only load CSS when needed
@@ -1071,11 +1577,35 @@ class ShortPixelAI {
         }
 	}
 
+	/**
+	 * Registers (see `_register()`) and enqueues a stylesheet from `assets/css/`.
+	 *
+	 * @param string      $name       Handle
+	 * @param string      $file       File name under `assets/css/` without extension
+	 * @param bool        $onlyMin    Always use `.min.css` (otherwise the unminified file under `SHORTPIXEL_AI_DEBUG`)
+	 * @param bool|string $addVersion false: no version; true: plugin version; string: that version
+	 * @param string[]    $deps
+	 *
+	 * @return void
+	 */
 	public function enqueue_style($name, $file, $onlyMin = true, $addVersion = false, $deps = []) {
 	    $this->_register('css', $name, $file, $onlyMin, $addVersion, $deps);
 	    wp_enqueue_style($name);
     }
 
+    /**
+     * Registers (see `_register()`) and optionally enqueues a script from `assets/js/`.
+     *
+     * @param string      $name       Handle
+     * @param string      $file       File name under `assets/js/` without extension
+     * @param bool        $enqueue    Enqueue after registering
+     * @param bool        $onlyMin    Always use `.min.js`
+     * @param bool|string $addVersion false: no version; true: plugin version; string: that version
+     * @param string[]    $deps
+     * @param bool        $defer      Use the `defer` loading strategy (WordPress >= 6.3)
+     *
+     * @return void
+     */
     public function register_js($name, $file, $enqueue = true, $onlyMin = false, $addVersion = true, $deps = [], $defer = false) {
         $this->_register('js', $name, $file, $onlyMin, $addVersion, $deps, $defer);
         if($enqueue) {
@@ -1083,6 +1613,23 @@ class ShortPixelAI {
         }
     }
 
+    /**
+     * Registers `assets/<type>/<file>[.min].<type>`.
+     *
+     * The unminified file is used only when `SHORTPIXEL_AI_DEBUG` is on and `$onlyMin` is false. With a version requested,
+     * debug mode uses the file's crc32 hash; otherwise `true` means `SHORTPIXEL_AI_VERSION` and a string is used as is.
+     * Scripts load in the footer, with `['strategy' => 'defer']` when `$defer` and WordPress >= 6.3.
+     *
+     * @param string      $type `js` or `css`
+     * @param string      $name Handle
+     * @param string      $file File name without extension
+     * @param bool        $onlyMin
+     * @param bool|string $addVersion
+     * @param string[]    $deps
+     * @param bool        $defer
+     *
+     * @return void
+     */
     protected function _register($type, $name, $file, $onlyMin = true, $addVersion = false, $deps = [], $defer = false) {
         global $wp_version;
         $ext = ( !!SHORTPIXEL_AI_DEBUG && !$onlyMin ? '' : '.min' ) . '.' . $type;
@@ -1100,6 +1647,12 @@ class ShortPixelAI {
         }
     }
 
+	/**
+	 * `admin_enqueue_scripts`: on the settings page (re)registers `popper-js` 2.4.4 and `tippy-js` 6.2.6; on every admin page
+	 * enqueues `spai-admin-scripts` (`admin.js`) localized as `spaiNonce = {nonce: <shortpixel-ai-settings nonce>}` with the CSP nonce applied.
+	 *
+	 * @return void
+	 */
 	public function enqueue_admin_script() {
 		$min     = ( !!SHORTPIXEL_AI_DEBUG ? '' : '.min' );
         if(Page::isCurrent('settings')) {
@@ -1122,16 +1675,22 @@ class ShortPixelAI {
 	}
 
 	/**
-	 * Method increases current css cache version to refresh files on the cdn
+	 * Increments `flags.all.css_ver` (default 0) so CSS/JS CDN URLs get a new `v_<N>` token and are refetched.
+	 * Used by the cache-plugin hooks, the admin bar action and `wp shortpixel clear-css`.
+	 *
+	 * @return bool true when the option was written
 	 */
 	public static function clear_css_cache() {
 		return !!Options::_()->set( Options::_()->get( 'css_ver', [ 'flags', 'all' ], 0 ) + 1, 'css_ver', [ 'flags', 'all' ] );
 	}
 
     /**
-     *  auth guard for settings-related AJAX actions
+     * Auth guard for the selector-list AJAX actions.
      *
-     * @param array $result
+     * Requires `is_admin()` (admin-ajax), capability `manage_options`, and nonce action `shortpixel-ai-settings` in field
+     * `spainonce` (`check_ajax_referer( ..., false )`, no die). On failure writes the reason into `$result['message']`.
+     *
+     * @param array $result Response array, modified by reference
      * @return bool
      */
     private function can_manage_settings_ajax( &$result ) {
@@ -1155,6 +1714,20 @@ class ShortPixelAI {
     }
 
     //TODO refactor
+    /**
+     * AJAX `shortpixel_ai_add_selector_to_list` (sniper "exclude/don't resize/don't lazy-load" actions).
+     *
+     * Guard: `can_manage_settings_ajax()` (nonce action `shortpixel-ai-settings`, field `spainonce`, capability `manage_options`).
+     * Input: `$_POST['selector']` (non-empty string, whitespace collapsed) and `$_POST['which_list']`, one of
+     * `noresize_selectors`, `excluded_selectors`, `excluded_paths`, `eager_paths`, `eager_selectors`.
+     * For the two path lists (delimiter "\n") the URL is turned into a rule: a leading CDN URL is cut off; if `/http` remains
+     * the part from `http` on is kept as is; else after `///` or after the first two `/` segments it becomes `path:<rest>`;
+     * then, unless `SPAI_FILENAME_RESOLUTION_UNSAFE`, the `-WxH` thumbnail suffix is removed. Selector lists use `,`.
+     * A duplicate returns status `ok` with a "already present" message. On save `CacheCleaner::clear()` decorates the message.
+     * Responds `{status: ok|error, message, list}` via `wp_send_json()`.
+     *
+     * @return void
+     */
     public function add_selector_to_list() {
         $result = array('status' => 'error', 'message' => __( 'An error occurred, please contact support.', 'shortpixel-adaptive-images' ));
         $which = isset($_POST['which_list']) ? wp_unslash($_POST['which_list']) : '';
@@ -1198,6 +1771,7 @@ class ShortPixelAI {
                     }
                     //remove thumbnail part
                     if(!defined('SPAI_FILENAME_RESOLUTION_UNSAFE')) {
+                        // closure: replaces "-WxH.ext" with ".ext"
                         $selector = preg_replace_callback(self::THUMBNAIL_REGEX,
                             function($matches) {
                                 return '.' . $matches[2];
@@ -1232,6 +1806,19 @@ class ShortPixelAI {
     }
 
     //TODO refactor
+    /**
+     * AJAX `shortpixel_ai_remove_selector_from_list`.
+     *
+     * Guard: `can_manage_settings_ajax()` (nonce action `shortpixel-ai-settings`, field `spainonce`, capability `manage_options`).
+     * Input: `$_POST['selector']` and `$_POST['which_list']` (same five lists as `add_selector_to_list()`). For `excluded_paths`
+     * a selector with doubled backslashes is matched un-doubled. Removes every equal item, saves, and responds
+     * `{status, message, list}` via `wp_send_json()`; a missing item returns status `ok` with "does not exist".
+     *
+     * @return void
+     * @todo `remove_selector_from_list()` uses "\n" only for `excluded_paths`; `eager_paths` is split and re-joined with `,`,
+     *       so the remaining paths are saved joined by `,` and read back later as one bogus rule. Use "\n" for both path lists, as `add_selector_to_list()` does.
+     * @todo The empty-selector branch of `remove_selector_from_list()` answers "Invalid list has been provided." instead of the invalid-selector message.
+     */
     public function remove_selector_from_list() {
         $result = array('status' => 'error', 'message' => __( 'An error occurred, please contact support.', 'shortpixel-adaptive-images' ));
         $which = isset($_POST['which_list']) ? wp_unslash($_POST['which_list']) : '';
@@ -1286,7 +1873,7 @@ class ShortPixelAI {
     }
 
 	/**
-	 * Method returns the result of testing is the plugin is in the beta stage
+	 * Tells whether `SHORTPIXEL_AI_VERSION` contains `beta` (case-insensitive).
 	 *
 	 * @return bool
 	 */
@@ -1295,7 +1882,30 @@ class ShortPixelAI {
 	}
 
 	/**
-	 * Method migrates to the new Options implementation used in 2.x
+	 * Migrates the 1.x `spai_settings_*` options into `short_pixel_ai_options` (called by `activate()`).
+	 *
+	 * Runs only when `spai_settings_compress_level` exists. First copies `areas.native_lazy` to `behaviour.native_lazy` when set.
+	 * If `compression.level` is still empty it maps:
+	 * - `spai_settings_compress_level` -> `compression.level` (1 or missing `lossy`, 2 `glossy`, other `lossless`);
+	 * - `spai_settings_webp` -> `compression.webp`; `spai_settings_remove_exif` -> `compression.remove_exif`;
+	 * - `spai_settings_fadein` -> `behaviour.fadein`; `spai_settings_crop` -> `behaviour.crop`;
+	 * - `spai_settings_type` -> `behaviour.replace_method` (1 `src`, 3 `both`, other `srcset`);
+	 * - `spai_settings_api_url` -> `behaviour.api_url`; `spai_settings_hover_handling` -> `behaviour.hover_handling`;
+	 * - `spai_settings_native_lazy` -> `behaviour.native_lazy`;
+	 * - `spai_settings_backgrounds_lazy` -> `areas.backgrounds_lazy` and `areas.backgrounds_lazy_style`;
+	 * - `spai_settings_backgrounds_max_width` -> `areas.backgrounds_max_width` (int);
+	 * - `spai_settings_parse_css_files` -> `areas.parse_css_files` (bool); `spai_settings_css_domains` -> `areas.css_domains`;
+	 * - `spai_settings_parse_js`, `_parse_js_lazy`, `_parse_json`, `_parse_json_lazy` -> `areas.parse_js`, `parse_js_lazy`, `parse_json`, `parse_json_lazy`;
+	 * - `spai_settings_excluded_paths`, `_excluded_selectors`, `_noresize_selectors`, `_eager_selectors` -> `exclusions.*` of the same name;
+	 * - `spai_settings_account` -> `flags.all.account`; `spai_settings_css_ver` (default 1) -> `flags.all.css_ver`;
+	 * - `spai_settings_dismissed_notices` -> `notices.dismissed`.
+	 * Then sets `flags.all.firstInstall` = false and deletes all the above plus `spai_settings_parse_css_files_changing_ward`,
+	 * `spai_settings_missing_jquery`, `spai_settings_tab`, `spai_settings_ext_meta`.
+	 * Without 1.x options and with `flags.all.firstInstall` null: sets `firstInstall` = true, `compression.level` = `lossy`, `behaviour.alter2wh` = 0.
+	 *
+	 * @return void
+	 * @todo The `areas.native_lazy` -> `behaviour.native_lazy` copy in `migrate_options()` runs only inside the 1.x branch, so 2.x installs that
+	 *       still hold `areas.native_lazy` are never moved. Move it out of the `spai_settings_compress_level` condition.
 	 */
 	public static function migrate_options() {
 		if ( get_option( 'spai_settings_compress_level', false ) !== false ) {
@@ -1398,7 +2008,13 @@ class ShortPixelAI {
 	}
 
 	/**
-	 * Method to be able to migrate back to the 1.x plugin version
+	 * Writes the current settings back to the 1.x `spai_settings_*` options and deletes the `settings` category
+	 * (used by the feedback/downgrade flow). Runs only when `compression.level` is set.
+	 *
+	 * Reverse mapping of `migrate_options()` (`lossy` 1, `glossy` 2, else 0; `src` 1, `both` 3, else 0), plus
+	 * `spai_settings_topbarmenu`, which `migrate_options()` neither reads nor deletes.
+	 *
+	 * @return void
 	 */
 	public static function revert_options() {
 		$options = Options::_();
@@ -1448,6 +2064,18 @@ class ShortPixelAI {
 		}
 	}
 
+	/**
+	 * Activation hook: re-schedules `spai_account_check_event` (`twicedaily`), runs `migrate_options()`, sets
+	 * `tests.front_end.enqueued` = true and `pages.on_boarding.redirectAllowed` = true, and writes the `.htaccess` CORS
+	 * block (`AccessControlHeaders::addHeadersToHtaccess()`) when `areas.parse_css_files > 0`.
+	 *
+	 * @todo activate() ignores the `$network_wide` argument of `register_activation_hook`: on a network
+	 *       activation only the current site is set up and migrated (`migrate_options()` is the only
+	 *       place that sets the compression level, so subsites emit an empty `q_` token until they are
+	 *       activated one by one), and no `wp_initialize_site` hook covers new sites. Iterate the sites.
+	 *
+	 * @return void
+	 */
 	public static function activate() {
 		// deleting already scheduled event
 		wp_clear_scheduled_hook( self::ACCOUNT_CHECK_SCHEDULE[ 'name' ] );
@@ -1468,6 +2096,17 @@ class ShortPixelAI {
         }
 	}
 
+    /**
+     * Deactivation hook: clears the `spai_account_check_event` and `spai_lqip_generate_event` crons, removes the `.htaccess`
+     * CORS block, clears the debug log and sets `tests.front_end.enqueued` = true. No option is deleted.
+     *
+     * @todo deactivate() ignores `$network_wide`: a network deactivation clears the crons of the current
+     *       site only, and on a network the `.htaccess` is shared, so a per-site deactivation removes the
+     *       CORS block the other sites still need. Iterate the sites; remove the block only when no site
+     *       parses CSS any more.
+     *
+     * @return void
+     */
     public static function deactivate() {
 		// deleting already scheduled events
 		wp_clear_scheduled_hook( self::ACCOUNT_CHECK_SCHEDULE[ 'name' ] );
@@ -1480,6 +2119,29 @@ class ShortPixelAI {
 		Options::_()->tests_frontEnd_enqueued = true;
     }
 
+    /**
+     * Detects plugins/themes that conflict with SPAI and returns a conflict key.
+     *
+     * A cached show-stopper is returned at once; otherwise `$conflict` restarts at `none` and the checks run in order:
+     * - `ao` (show-stopper): Autoptimize active (or `is_plugin_active()` unavailable) with image optimisation
+     *   (`autoptimize_imgopt_settings[autoptimize_imgopt_checkbox_field_1] == '1'`, AO >= 2.5) or lazy load
+     *   (`autoptimize_extra_settings[autoptimize_extra_checkbox_field_5]`, AO <= 2.4.4);
+     * - `divitoolbox` (returns): Divi Toolbox < 1.4.2 with `dtb_toolbox[dtb_post_meta]`;
+     * - `llopt` (returns): Lazy Load Optimizer active;
+     * - `ginger` (show-stopper, returns): Ginger EU Cookie Law with `ginger_general[ginger_opt] === 'in'`;
+     * - `speedoptimizer` (returns): SiteGround Optimizer with `siteground_optimizer_combine_javascript === '1'`;
+     * - `avadalazy` (show-stopper): theme name contains `Avada` and `fusion_options[lazy_load] == '1'`;
+     * - Elementor / Elementor Pro with `elementor_css_print_method == 'external'`: when `areas.parse_css_files == 0` it
+     *   **persists** `parse_css_files = 1`; when it is -1 (explicitly off) returns `elementorexternal`.
+     * Show-stoppers (`self::$SHOW_STOPPERS`): `ao`, `avadalazy`, `ginger`; the others only drive notices.
+     *
+     * @return string One of `none`, `ao`, `divitoolbox`, `llopt`, `ginger`, `speedoptimizer`, `avadalazy`, `elementorexternal`
+     * @todo In `is_conflict()` a later check overwrites an earlier show-stopper: `ao` is replaced by `llopt`, `divitoolbox`,
+     *       `speedoptimizer`, `avadalazy` or `elementorexternal`, so Autoptimize no longer disables rewriting. Return as soon as a show-stopper is found.
+     * @todo `is_plugin_active()` is not loaded on front-end requests, so the Divi Toolbox, Lazy Load Optimizer, Ginger and SiteGround
+     *       checks in `is_conflict()` never match there and the `ginger` show-stopper does not stop the front-end hooks. Require `wp-admin/includes/plugin.php` or read `active_plugins`.
+     * @todo `is_conflict()` calls `unserialize()` on `get_option( 'dtb_toolbox' )`, which is already unserialized; an array value raises a TypeError on PHP 8. Use the value directly (or `maybe_unserialize()`).
+     */
     public function is_conflict() {
 	    if ( in_array( $this->conflict, self::$SHOW_STOPPERS ) ) { // the elementorexternal doesn't deactivate the plugin
 		    return $this->conflict;
@@ -1554,6 +2216,13 @@ class ShortPixelAI {
         return $this->conflict;
     }
 
+    /**
+     * Returns the extension of the URL's path (`pathinfo` on `parse_url( PHP_URL_PATH )`), '' when the path has none.
+     *
+     * @param string $url
+     *
+     * @return string|null null when the URL has no path
+     */
     public function get_extension( $url ) {
         $path = parse_url( $url, PHP_URL_PATH );
         if ( !is_string( $path ) || empty( $path ) ) {
@@ -1562,10 +2231,24 @@ class ShortPixelAI {
         return pathinfo( $path, PATHINFO_EXTENSION );
     }
 
+    /**
+     * Tells whether the URL starts with `https://` (case-sensitive). Protocol-relative and relative URLs return false.
+     *
+     * @param string $url
+     *
+     * @return bool
+     */
     public static function is_ssl($url) {
         return strpos($url, 'https://') === 0;
     }
 
+    /**
+     * Removes a leading `http://` or `https://` (lower case only). `//host/...` is returned unchanged.
+     *
+     * @param string $url
+     *
+     * @return string
+     */
     public static function rem_proto($url) {
         return preg_replace('/^https?:\/\//', '', $url);
     }
@@ -1576,6 +2259,9 @@ class ShortPixelAI {
      * from the default "https://cdn.shortpixel.ai/spai".
      *
      * If it is different, we consider it a "custom CDN".
+     *
+     * @return bool
+     * @todo `is_custom_cdn()` has no caller.
      */
     private function is_custom_cdn()
     {
@@ -1590,6 +2276,11 @@ class ShortPixelAI {
         return $isBasicCustom;
     }
 
+    /**
+     * Tells whether the Amazon/S3 storage mode is usable: `behaviour.amazon_s3` on and `behaviour.storage_url` non-empty.
+     *
+     * @return bool
+     */
     private function is_amazon_cdn(){
         $amazonGet = $this->settings->behaviour->amazon_s3;
         $amazonEnabled   = !empty($amazonGet);
@@ -1602,9 +2293,9 @@ class ShortPixelAI {
     }
 
     /**
-     * chooses the appropriate API base URL based on CDN settings.
+     * Returns the CDN base without trailing slash: `behaviour.storage_url` when `is_amazon_cdn()`, else `get_cdn_url()`
+     * (default `https://cdn.shortpixel.ai/spai` when that is empty). Used by `VanillaJsLoader` to build `spaiData.customKeys`.
      *
-     * @param string|false $url The original URL.
      * @return string The selected base URL.
      */
     public function choose_api_base()
@@ -1622,6 +2313,11 @@ class ShortPixelAI {
         }
     }
 
+    /**
+     * Tells whether `behaviour.host_removal` is non-empty.
+     *
+     * @return bool
+     */
     private function do_host_removal(){
         $hostRemovalGet = $this->settings->behaviour->host_removal;
         $isHostRemoval   = !empty($hostRemovalGet);
@@ -1629,9 +2325,10 @@ class ShortPixelAI {
     }
 
     /**
-     * Applies host removal to the API URL if conditions are met.
+     * Applies host removal: when `behaviour.host_removal` is set and the URL's host contains it, returns
+     * `rtrim( $api_url, '/' ) . path [. '?' . query] [. '#' . fragment]` (host and scheme dropped); otherwise `$api_url` unchanged.
      *
-     * @param string $api_url The constructed API URL.
+     * @param string $api_url The constructed API URL (base + tokens).
      * @param string|false $url The original URL.
      * @return string The final URL after host removal (if applied).
      */
@@ -1669,6 +2366,7 @@ class ShortPixelAI {
      *
      * @param string $baseUrl  e.g. "https://cdn.shortpixel.ai/spai"
      * @param array  $args     e.g. [ ['w' => 300], ['q' => 'lossy'], ['ex' => '1'] ]
+     * @param string $separator Token separator, `self::SEP` (`+`) or `,`
      * @return string          e.g. "https://cdn.shortpixel.ai/spai/w_300+q_lossy+ex_1"
      */
     private function build_spai_url($baseUrl, array $args, $separator = self::SEP){
@@ -1681,6 +2379,54 @@ class ShortPixelAI {
         return  rtrim($api_url, $separator);
 
     }
+	/**
+	 * Builds a CDN URL (or, with `$url === false`, the CDN prefix that the JS and the parsers complete themselves).
+	 *
+	 * Grammar as implemented:
+	 * ```
+	 * result = <base> "/" <tok> (<sep> <tok>)* [ "/" <origin> ]
+	 * base   = rtrim( settings.behaviour.storage_url, '/' )
+	 *              when behaviour.amazon_s3 && storage_url != '' && behaviour.host_removal != '' && host(url) contains host_removal
+	 *        | rtrim( get_cdn_url(), '/' )          (filter `shortpixel/ai/cdnUrl` over behaviour.api_url)
+	 *        | "https://cdn.shortpixel.ai/spai"      when get_cdn_url() is empty
+	 * tok, in this order (types in ShortPixelUrlTools::$ONLY_STORE get none of w_/q_/ex_1/to_):
+	 *   w_<width>    when $width !== false; always the first token (the JS relies on it); `%WIDTH%` stays literal for the JS
+	 *   q_<level>    $compression ?: compression.level  (lossy | glossy | lossless | orig | lqip ...)
+	 *   ex_1         when !compression.remove_exif (keep EXIF)
+	 *   ret_img | ret_auto   ret_auto when $retAuto (css/js/fonts and js2cdn), else ret_img (always present)
+	 *   to_auto | to_webp | to_avif
+	 *                when $type !== 'noauto' && (compression.webp || compression.avif) && $this->varyCacheSupport
+	 *                && ( option `settings.compression.<$type>_to_webp` is null (no such key) || truthy );
+	 *                auto when webp and avif, else webp or avif. Only `png_to_webp`, `jpg_to_webp`, `gif_to_webp` exist,
+	 *                so `jpeg`/`jpe`/`jfif`, `css`, '' and false always convert; the extension is used with its original case
+	 *   p_h          when the origin is not https (`$url === false`: when the current request is not `is_ssl()`)
+	 *   v_<N>        when $cacheVer is truthy
+	 * sep    = $separator: `+` (self::SEP, default) or `,` (the regex parser passes it for `<link rel="preload">` URLs also present in the page)
+	 * origin = rem_proto( $url ): scheme removed, host kept, path/query/fragment kept verbatim (NOT URL-encoded)
+	 *        | path[?query][#fragment] only (host dropped) in the storage_url + host_removal case, see host_removal_logic()
+	 * ```
+	 * Example: `get_api_url( 'https://example.test/wp-content/uploads/a-300x200.jpg', 300, false, 'jpg' )` with lossy, EXIF
+	 * removed and WebP on gives `https://cdn.shortpixel.ai/spai/w_300+q_lossy+ret_img+to_webp/example.test/wp-content/uploads/a-300x200.jpg`.
+	 *
+	 * Early exits: `$url` set and `urlIsExcluded( $url )` -> `$url` unchanged; `$compression == 'orig'` with
+	 * `SHORTPIXEL_AI_ORIG_NO_CDN` defined -> ''. With `$url === false` the prefix `<base>/<tokens>` is returned without the trailing `/`.
+	 *
+	 * @param string|false $url         Absolute origin URL, or false for the prefix only
+	 * @param int|string|false $width   Width for `w_`, `%WIDTH%` placeholder, or false for no `w_`
+	 * @param int|string|false $height  Accepted and ignored (no `h_` token is emitted)
+	 * @param string|false $type        File extension of the origin (`get_extension()`), `noauto` (suppress `to_`), or false
+	 * @param string|false $compression Compression override for `q_` (TagRule custom compression, `orig`, `lqip`)
+	 * @param bool         $retAuto     Emit `ret_auto` instead of `ret_img`
+	 * @param int|false    $cacheVer    Value of `v_`
+	 * @param string       $separator   Token separator
+	 *
+	 * @return string
+	 * @todo `get_api_url()` never emits an `h_` token: `$height` is accepted and unused. Either emit `h_<H>` or drop the parameter.
+	 * @todo `get_api_url()` appends the origin without URL-encoding: spaces, `?`, `#` and non-ASCII characters pass through and the
+	 *       query/fragment of the origin become part of the CDN URL. Encode the path segments (rawurlencode per segment) or document the CDN contract.
+	 * @todo `get_api_url()` looks up `<ext>_to_webp`; `jpeg`, `jpe` and `jfif` have no key and are always converted even when `jpg_to_webp`
+	 *       is off. Map the JPEG aliases to `jpg` (and lower-case the extension) before the lookup.
+	 */
 	public function get_api_url( $url = false, $width = '%WIDTH%', $height = '%HEIGHT%', $type = false, $compression = false, $retAuto = false, $cacheVer = false, $separator = self::SEP) {
 
         if ($url && $this->urlIsExcluded($url)) {
@@ -1776,6 +2522,32 @@ class ShortPixelAI {
             }
         }
 
+    /**
+     * Output-buffer callback registered by `init_ob()`: rewrites the whole response.
+     *
+     * Dispatch, in order:
+     * 0. Not AJAX and `JsLoader::_( $this )->check( $content )` fails (SPAI script dequeued / bundle missing): sets `$spaiJSDequeued`.
+     * 1. AMP (`is_amp_endpoint()`): returned untouched.
+     * 2. JSON (`json_decode` gives no syntax error and a non-null value; with WP Grid Builder active a second try decodes from the
+     *    first `{"facets":{`): with `areas.parse_json` the decoded value goes through `ShortPixelJsonParser::parse()`; otherwise
+     *    only first-level string properties that look like HTML go through `ShortPixelRegexParser::parse()`. When anything is parsed
+     *    `AffectedTags::record()` runs and the content is replaced by `json_encode()` of the result (re-encoding escapes `/` and
+     *    non-ASCII, and drops any prefix before `{"facets":{`). REST responses are not excluded.
+     * 3. `$spaiJSDequeued`: HTML left untouched.
+     * 4. HTML sniff (optional BOM U+FEFF, optional comments, then `<!doctype` or `<tag`): `ShortPixelRegexParser::parse()`;
+     *    during AJAX also `AffectedTags::record()`.
+     * 5. Anything else (XML feeds starting with `<?xml`, plain text): untouched.
+     * Afterwards, when `behaviour.lqip` and `$blankInlinePlaceholders` is not empty: in `cron` process way they are sent to
+     * `LQIP::process()`, and in every way `CacheCleaner::excludeCurrentPage()` asks cache plugins not to cache the page.
+     *
+     * @param string $content Buffered response
+     *
+     * @return string
+     * @todo For a top-level JSON array, `maybe_replace_images_src()` assigns `$contentObj->$key` on an array, which throws an Error on PHP 8
+     *       when an element is an HTML string. Assign `$contentObj[ $key ]` for arrays.
+     * @todo The BOM `(\u{FEFF})?` part of the HTML sniff in `maybe_replace_images_src()` sits behind `version_compare( PHP_VERSION, '7.0.0' )`;
+     *       this PHP 5.6 shim is dead now that the plugin floor is PHP 7.4.
+     */
     public function maybe_replace_images_src($content)
     {
         (SHORTPIXEL_AI_DEBUG & ShortPixelAILogger::DEBUG_AREA_HTML) && $this->logger->log("maybe_replace_images_src - PROCESSING OUTPUT BUFFER."
@@ -1829,10 +2601,10 @@ class ShortPixelAI {
             }
         }
         elseif($this->spaiJSDequeued) {
-            //TODO in cazul asta vom inlocui direct cu URL-urile finale ca AO
+            //TODO in this case replace directly with the final CDN URLs, as Autoptimize does
             (SHORTPIXEL_AI_DEBUG & ShortPixelAILogger::DEBUG_AREA_HTML) && $this->logger->log("SPAI JS IS DEQUEUED. ABORTING.");
         }
-        //found a content starting with a zero width non-breaking space \xFEFF (HS#76951) and this matches: (\u{FEFF})?
+        //found a content starting with a zero width non-breaking space \xFEFF and this matches: (\u{FEFF})?
         elseif(preg_match("/^"
             . (version_compare(PHP_VERSION, '7.0.0') >= 0 ? "(\u{FEFF})?" : "")
             . "(\s*<!--.*-->)*(\s*<!--[^->!]+\-->)*\s*<\s*(!\s*doctype|\s*[a-z0-9]+)(\s+[^\>]+|)\/?\s?>/i", $content)) { //check if really HTML
@@ -1865,16 +2637,53 @@ class ShortPixelAI {
             return $this->_replace_images('src', $matches[0], $matches[1]);
         }*/
 
+    /**
+     * Output-buffer callback used when `SHORTPIXEL_AI_CLEANUP` is defined and the request is not welcome: replaces every
+     * `<cdn url>...<tokens>/http(s)://` prefix with `http(s)://`, i.e. strips CDN prefixes that still carry the scheme.
+     *
+     * Only the `/http(s)://` origin form is matched; scheme-less origins produced by `get_api_url()` are left in place.
+     *
+     * @param string $content
+     *
+     * @return string
+     * @todo The `maybe_cleanup()` pattern uses `.*?` with the `s` flag, so for a scheme-less CDN URL the match runs on to the next
+     *       `/http(s)://` anywhere later in the document and deletes everything in between. Restrict it to URL characters (e.g. `[^\s"\'()<>]*?`)
+     *       and also handle the scheme-less origin form.
+     */
     public function maybe_cleanup($content)
     {
         $this->logger->log('CLEANUP: ' . preg_quote($this->get_cdn_url(), '/'));
         return preg_replace_callback('/' . preg_quote($this->get_cdn_url(), '/') . '.*?\/(https?):\/\//is',
             array($this, 'replace_api_url'), $content);
     }
+    /**
+     * `preg_replace_callback` helper of `maybe_cleanup()`.
+     *
+     * @param string[] $matches Group 1 is the scheme
+     *
+     * @return string `<scheme>://`
+     */
     public function replace_api_url($matches) {
         return $matches[1] . '://';
     }
 
+    /**
+     * Filter `wp_calculate_image_srcset` (registered by `init_ob()`).
+     *
+     * Returns `$sources` unchanged on AMP, when `$image_src` is excluded or not `ShortPixelUrlTools::isValid()`, or when
+     * `behaviour.replace_method === 'src'` (the parser later removes the srcset). Otherwise each source whose URL is already
+     * an SPAI placeholder (`url_from_placeholder_svg() !== false`) is regenerated as a placeholder of width `<key>` and the
+     * height derived from the first image's aspect ratio; if any such source is excluded the original array is returned.
+     *
+     * @param array  $sources       WP srcset sources keyed by width
+     * @param array  $size_array    Unused
+     * @param string $image_src
+     * @param array  $image_meta    Unused
+     * @param int    $attachment_id Unused
+     *
+     * @return array
+     * @todo `replace_image_srcset()` divides by `$sizes[0]` without checking that `get_image_size()` returned a non-zero width.
+     */
     public function replace_image_srcset( $sources, $size_array, $image_src, $image_meta, $attachment_id) {
         if((function_exists('is_amp_endpoint') && is_amp_endpoint())) {
             return $sources;
@@ -1911,6 +2720,16 @@ class ShortPixelAI {
         return $pseudoSources;
     }
 
+	/**
+	 * Splits the exclusion settings into arrays (see `splitSelectors()`).
+	 *
+	 * Selector lists (`excluded_selectors`, `eager_selectors`, `noresize_selectors`) are comma-delimited (newlines accepted).
+	 * Path lists (`excluded_paths`, `eager_paths`, `excluded_pages`) are one rule per line; each line is
+	 * `regex:<PCRE with delimiters>`, `path:<substring>`, `http:<rest>` / `https:<rest>` (a full URL), or `domain:<host substring>`,
+	 * matched by `isExcluded()`. Lines without `:` are ignored by the matcher.
+	 *
+	 * @return object{excluded_selectors: string[], eager_selectors: string[], noresize_selectors: string[], excluded_paths: string[], eager_paths: string[], excluded_pages: string[]}
+	 */
 	public function getExclusionsMap() {
         $ex = @$this->settings->exclusions;
 		return (object) [
@@ -1923,6 +2742,27 @@ class ShortPixelAI {
 		];
 	}
 
+	/**
+	 * Tells whether an HTML tag matches the `excluded`, `eager` or `noresize` rules server-side.
+	 *
+	 * True when the tag carries `data-spai-<type>` (word-bounded), else when it matches one item of
+	 * `$this->exclusions-><type>_selectors`. Supported selector forms (one simple selector, no combinators):
+	 * - `.class` / `tag.class`: `tag` must be the tag name right after `<` (prefix test); the class must be one of the
+	 *   space-separated words of a quoted `class` attribute, or the whole unquoted value; `*` in the class is a wildcard `[a-zA-Z0-9_-]*`;
+	 * - `#id` / `tag#id`: quoted `id` attribute equal to the id;
+	 * - `[attr]`, `[attr=value]`, `tag[attr]`, `tag[attr="value"]`: attribute present / attribute value prefix match;
+	 * - `tag`: the text after `<` starts with the selector.
+	 * Selectors with more than one `.` (e.g. `img.a.b`), descendant or child combinators, pseudo-classes and lists fall through
+	 * and only the JS side applies them.
+	 *
+	 * @param string $type `excluded`, `eager` or `noresize`
+	 * @param string $text The opening tag markup, starting with `<`
+	 *
+	 * @return bool
+	 * @todo `tagIs()` inserts the class, id, attribute name and value into regexes without `preg_quote()`, so selectors containing `.`, `+`,
+	 *       `(`, `/` etc. mis-match or raise PCRE warnings. Quote each part (keeping the `*` wildcard expansion).
+	 * @todo The bare-tag branch of `tagIs()` is a prefix test: selector `a` matches `<audio`, `img` matches `<imgx`. Require a following space, `/` or `>`.
+	 */
 	public function tagIs( $type, $text ) {
         //First check if marked with data-spai attribute
         if(preg_match('/\bdata-spai-' . $type . '\b/', $text)) {
@@ -1970,6 +2810,13 @@ class ShortPixelAI {
 		return false;
 	}
 
+	/**
+	 * Tells whether the URL's host equals the host of `get_cdn_url()`.
+	 *
+	 * @param string $url
+	 *
+	 * @return bool
+	 */
 	public function urlIsApi( $url ) {
 		$parsed    = parse_url( $url );
 		$parsedApi = parse_url( $this->get_cdn_url() );
@@ -1985,6 +2832,9 @@ class ShortPixelAI {
      *
      * useful when comparing image URLs against exclusion rules, insuring that any
      * appended resolution suffix does not prevent a match with the base URL.
+     *
+     * The result is rebuilt as `<scheme>://<home_url host><path without -WxH>`: the host is always the site's host and the
+     * query and fragment are dropped, so an external URL is normalized onto the site host. A URL without a path is returned as is.
      *
      * @param string $url - original image URL.
      * @return string -  normalized image URL without the resolution suffix, or the original URL if parsing fails.
@@ -2009,9 +2859,16 @@ class ShortPixelAI {
     /**
      * Core URL-matching method to test either total or eager exclusion.
      *
+     * Steps: (1) a URL on the CDN host is meant to be reverted to its origin; (2) a URL containing `?page=` and the admin path
+     * (e.g. Jetpack admin-bar stats images) is always a match; (3) the URL and its `normalizeUrlForExcluded()` form are tested
+     * with `isExcluded()` against `settings.exclusions.excluded_paths` (`excluded`) or `settings.exclusions.eager_paths` (any other mode).
+     * Rule grammar per line: see `isExcluded()`.
+     *
      * @param  string $mode  Either 'excluded' (full exclusion) or 'eager' (skip lazy only)
      * @param  string $url   The image URL (may include CDN, Amazon, any host or size suffix)
      * @return bool          True for matching either one mode’s rules
+     * @todo The "revert CDN url" step of `urlIs()` is a no-op: it strips the scheme and puts the same scheme back, so CDN URLs are
+     *       matched with their CDN host and tokens. Strip `<cdn base>/<tokens>/` and restore the origin scheme (`https://` unless `p_h`).
      */
     public function urlIs($mode, $url)
     {
@@ -2071,10 +2928,14 @@ class ShortPixelAI {
     }
 
 	/**
-	 * Return if a page is Excluded
-	 * @param $page
+	 * Tells whether a page URL matches `settings.exclusions.excluded_pages` (grammar: see `isExcluded()`).
 	 *
-	 * @return mixed
+	 * Defaults to `home_url( $_SERVER['REQUEST_URI'] )`. Results are cached per URL in a function-static array for the
+	 * life of the PHP process (not reset with the singleton; tests must use distinct URLs or accept the cached result).
+	 *
+	 * @param string|null $page Absolute page URL
+	 *
+	 * @return bool
 	 */
 	public function pageIsExcluded($page = null) {
 		static $pagesCache = [];
@@ -2094,6 +2955,27 @@ class ShortPixelAI {
 
 	}
 
+	/**
+	 * Matches a URL against a newline-delimited rule list.
+	 *
+	 * Each line is split at the first `:` into `<type>:<value>` (value trimmed, so `\r` is harmless); lines without `:` are ignored.
+	 * Rules are tried in order, first match wins:
+	 * - `regex:<pattern>`: `preg_match( pattern, url )` (pattern with delimiters; errors suppressed);
+	 * - `path:<s>`, `http:<s>`, `https:<s>`: for `http`/`https` the value is the URL minus the scheme word, e.g. `https://host/a.jpg`
+	 *   gives `//host/a.jpg`. Matches when the value is a substring of the URL; else when the rule's path equals the URL's path
+	 *   after removing `-WxH` suffixes from both (host-insensitive); else, if the URL path has a `-WxH.ext` thumbnail suffix,
+	 *   the result of `urlIsExcluded()` for the URL without the suffix is returned;
+	 * - `domain:<s>`: case-insensitive substring of the URL's host.
+	 * Example: `path:/wp-content/uploads/logo` excludes `https://site/wp-content/uploads/logo-150x150.png`.
+	 *
+	 * @param string $url
+	 * @param string $excludedList Raw rule list (one rule per line)
+	 *
+	 * @return bool
+	 * @todo The thumbnail fallback in `isExcluded()` calls `urlIsExcluded()`, which always checks `excluded_paths`, even when `$excludedList`
+	 *       is `eager_paths` or `excluded_pages`; and it `return`s the result, so a false result skips every later rule of the list. Recurse with
+	 *       `$this->isExcluded( $urlMain, $excludedList )` and only return when it is true.
+	 */
 	protected function isExcluded($url, $excludedList) {
 
 		//$this->logger->log("IS EXCLUDED? $url");
@@ -2157,9 +3039,10 @@ class ShortPixelAI {
 	}
 
     /**
-     *  checks if page is admin generated with Breakdance Page Builder
-     * @return bool True - if it is Breakdance builder - False otherwise
+     * Checks whether the request comes from the Breakdance builder: `?_breakdance_doing_ajax=yes`, `?breakdance_iframe=true`
+     * or `?breakdance=builder`.
      *
+     * @return bool True - if it is Breakdance builder - False otherwise
      */
     private function isBreakdanceBuilder() {
         $bdAjaxCondition = isset($_GET['_breakdance_doing_ajax']) && $_GET['_breakdance_doing_ajax'] == 'yes';
@@ -2174,7 +3057,29 @@ class ShortPixelAI {
 
 
     /**
-     * @return bool true if SPAI is welcome ( not welcome for example if it's an AMP page, CLI, is admin page or PageSpeed is off )
+     * Decides whether SPAI rewrites the current request. Called by `init_ob()` (`init` prio 1), `enqueue_script()` and the toolbar.
+     *
+     * Bypasses (returns false), in evaluation order:
+     * 1. `DONOTCDN` defined;
+     * 2. `flags.all.credits` falsy (default 1);
+     * 3. `pageIsExcluded()` (current URL matches `excluded_pages`);
+     * 4. with an `HTTP_REFERER`: referrer path is `<admin>/customize.php`, or `<admin>/post.php` unless `$_REQUEST['preview'] === 'true'`;
+     * 5. AJAX whose referrer is on the admin host and under the admin path;
+     * 6. Breakdance builder (`isBreakdanceBuilder()`);
+     * 7. one expression, any of: `is_feed()`; `DOING_AUTOSAVE`; `DOING_CRON`; `WP_CLI`; `?PageSpeed=off` or referrer path containing
+     *    `PageSpeed=off`; `?SPAIOpt=off` or referrer path containing `SPAIOpt=off`; `tests.front_end.missing_jquery` in jQuery mode
+     *    (`behaviour.nojquery <= 0`); `?fl_builder` or referrer path containing `/?fl_builder` (Beaver Builder); `?tve=true` (Thrive);
+     *    `?ct_builder=true` (Oxygen); `?mailpoet_router`; `?oxygen_iframe=true`; `?zn_pb_edit=1` (Zion); `$_REQUEST['action']` in
+     *    `self::$excludedAjaxActions`; admin screen with a logged-in user outside AJAX; `behaviour.replace_logged_in` off and user logged in;
+     *    AJAX with uploaded files (`$_FILES`).
+     * Not checked: `REST_REQUEST`, login/register pages, XML-RPC, user agent, `is_customize_preview()`, AMP (handled in `maybe_replace_images_src()`).
+     *
+     * @return bool true if SPAI is welcome
+     * @todo `is_feed()` in `isWelcome()` is evaluated before the main query when called from `init_ob()` (`init` prio 1), so it is always
+     *       false there; feeds are only left alone because the HTML sniff in `maybe_replace_images_src()` rejects `<?xml`. Move the feed check into the buffer callback.
+     * @todo The referrer checks for `PageSpeed=off`, `SPAIOpt=off` and `/?fl_builder` in `isWelcome()` look in `parse_url()['path']`, which never
+     *       contains the query string, so they never match. Test `$referrer['query']` instead.
+     * @todo The debug log line of `isWelcome()` tests `defined( ' - DOING_AUTOSAVE' )` and similar names with a ` - ` prefix, which are never defined, so autosave/cron/CLI are never logged.
      */
 	public function isWelcome() {
         if(defined('DONOTCDN')) {
@@ -2261,7 +3166,16 @@ class ShortPixelAI {
 	}
 
 	/**
-	 * Sets all settings to simple mode defaults
+	 * Sets all settings to simple mode defaults (each value written with `Options::set()` into `settings.<category>`).
+	 *
+	 * compression: avif 0, remove_exif 1, png/jpg/gif_to_webp 1 (webp itself is set by the UI);
+	 * behaviour: fadein 0, crop 0, replace_method `src`, generate_noscript 0, api_url `https://cdn.shortpixel.ai/spai`,
+	 * lazy_threshold 500, hover_handling 0, replace_logged_in 1, lqip 0, process_way `cron`, native_lazy 0, alter2wh 0,
+	 * sizespostmeta 0, size_breakpoints 0, nojquery 2;
+	 * areas: lity 0, parse_js_lazy 0, parse_json_lazy 0, backgrounds_max_width 1920, backgrounds_lazy_style and
+	 * backgrounds_lazy = (`parse_css_files > 0`);
+	 * exclusions: excluded_paths GRAVATAR_REGEX, eager_paths/eager_selectors/noresize_selectors/excluded_selectors/excluded_pages ''.
+	 *
 	 * @return void
 	 */
 	public static function setSimpleDefaultOptions()
@@ -2322,7 +3236,14 @@ class ShortPixelAI {
 	}
 
 	/**
-	 * @param object $options
+	 * Translates the simple-mode meta options of a posted settings object into real ones and removes `simple`.
+	 *
+	 * `simple.simple_level` -> `compression.level`; `simple.simple_webp` -> `compression.webp`;
+	 * `simple.simple_optimize_backgrounds` -> `areas.backgrounds_lazy_style`, `areas.backgrounds_lazy`, `areas.parse_css_files`;
+	 * `simple.simple_optimize_js_images` -> `areas.js2cdn`, `areas.parse_js`, `areas.parse_json`.
+	 * Missing `compression`/`areas` objects are created when needed.
+	 *
+	 * @param object $options Settings object as posted by the settings page
 	 *
 	 * @return object
 	 */
@@ -2362,7 +3283,12 @@ class ShortPixelAI {
 
     /**
      * Simple options are mostly meta options. Infer them from the real options.
-     * @param $settings
+     *
+     * True when the settings are representable in simple mode: backgrounds_lazy_style === backgrounds_lazy === (parse_css_files > 0),
+     * js2cdn === parse_js === parse_json, parse_js_lazy and parse_json_lazy off, webp == png_to_webp === jpg_to_webp === gif_to_webp,
+     * avif === 0 and remove_exif === 1 (strict comparisons: `'0'`/`true` values fail).
+     *
+     * @param object $settings Settings object (categories `areas`, `compression`)
      * @return boolean true if simple options were inferred, false if not
      */
     public static function verifySimpleOptions($settings )
@@ -2389,7 +3315,10 @@ class ShortPixelAI {
      * Wraps $this->settings->behaviour->api_url into a variable that gets filtered
      * so anyone using the filter can return his own custom cdn
      * (one example is for returning different cdn url's for separate language domains - SEO wise?)
-     * @return mixed
+     *
+     * Filter: `shortpixel/ai/cdnUrl` (string $cdn_url). Default value `https://cdn.shortpixel.ai/spai`.
+     *
+     * @return mixed The filtered CDN base URL (normally a string)
      */
     public function get_cdn_url() {
 

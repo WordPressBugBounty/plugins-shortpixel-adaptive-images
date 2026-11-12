@@ -1,5 +1,31 @@
 <?php
 	/**
+	 * On-boarding wizard template (`admin.php?page=shortpixel-ai-on-boarding`).
+	 *
+	 * Included by `ShortPixel\AI\Page::render( 'on-boarding.tpl.php' )` inside `<div class="wrap">`, so `$this` is the
+	 * `ShortPixel\AI\Page` instance (`$this->ctrl`, `$this->data` plugin header, `$this->getNonce()`).
+	 * Assets: `spai-on-boarding` (`assets/js/pages/on-boarding.js`) and `spai-js-cookie`, enqueued by
+	 * `Page::enqueueAdminScripts()`.
+	 *
+	 * Variables defined here: `$controller` (`$this->ctrl`), `$dismissed` (`Notice::getDismissed()`), `$has_conflict`
+	 * (a show-stopper conflict, the jQuery-missing test, or SPIO WebP markup, each unless dismissed), `$steps`
+	 * (`Page\Constants::_()->onBoarding`), `$step` (`pages.on_boarding.step`, capped at the last step), `$steps_qty`,
+	 * `$domain_status`, `$domain_cdn_usage`.
+	 *
+	 * Remote calls made while rendering: `Page\Constants` construction (domain status refreshed + CDN usage, first
+	 * use only), `ShortPixelDomainTools::get_domain_status( true )` (refreshed) and `get_cdn_domain_usage()`.
+	 *
+	 * Output: the campaign banner (`.shortpixel-bf`, `ShortPixelAI::renderPromoBanner()`) under the title when one shows, then a conflict message, a quota-exceeded message (`Status === -1`), or the traffic summary, the step list
+	 * `.shortpixel-steps[data-step][data-spainonce]` (`.step.active` / `.step.passed`) and `.step-message-wrap` with the
+	 * current step's HTML, whose `[data-action]` buttons (`go to settings`, `run front worker`, `save key`,
+	 * `use same account`) and `.next_icon` / `.done` buttons `on-boarding.js` posts to `shortpixel_ai_handle_page_action`
+	 * with `page=on-boarding`.
+	 *
+	 * @todo The quota-exceeded "Please top-up your account…" `__()` call has no text domain; add
+	 *       `'shortpixel-adaptive-images'`.
+	 * @todo The traffic summary reads `$domain_cdn_usage->quota->…` when `$domain_cdn_usage` is truthy but has no
+	 *       `quota` (error response), and `$domain_status->…` without checking the remote call returned an object.
+	 *
 	 * @var \ShortPixelAI $controller
 	 */
 	$controller = $this->ctrl;
@@ -21,6 +47,7 @@
 	$domain_cdn_usage = ShortPixelDomainTools::get_cdn_domain_usage(null, $controller->options->settings_general_apiKey);
 ?>
 	<h1><?php echo $this->data[ 'Name' ]; ?></h1>
+	<?php $controller->renderPromoBanner(); ?>
 	<div class="shortpixel-on-boarding-wrap wrap">
 		<div class="sp-obw__title-wrap">
 			<img

@@ -1,15 +1,21 @@
 <?php
 /**
- * User: simon
- * Date: 17.11.2020
+ * WP-CLI commands of SPAI (file loaded only when `WP_CLI` is defined).
  */
 
 /**
- * Just a few sample commands to learn how WP-CLI works
+ * `wp shortpixel <command>` (WP-CLI turns the method underscores into dashes):
+ * - `clear-css`: increments `flags.all.css_ver` in `short_pixel_ai_options` (new `v_` token for CSS/JS CDN URLs);
+ * - `cleanup-postmeta-pseudourls`: rewrites post meta values that contain SPAI SVG placeholders back to the original URLs;
+ * - `clear-lqips`: deletes option `shortpixel_ai_lqip_state` and the `uploads/spai/lqip` cache directory.
  */
 class ShortPixelCLI extends WP_CLI_Command {
     /**
      * Clear the CSS cache.
+     *
+     * Calls `ShortPixelAI::clear_css_cache()` and prints whether the option write succeeded.
+     *
+     * @return void
      */
     function clear_css() {
         if(!!ShortPixelAI::clear_css_cache()) {
@@ -19,6 +25,15 @@ class ShortPixelCLI extends WP_CLI_Command {
         }
     }
 
+    /**
+     * Restores original URLs in post meta that stored SPAI placeholders.
+     *
+     * Selects rows of `<prefix>postmeta` whose `meta_value` is LIKE `%data:image_svg+xml;base64%`; serialized values are
+     * unserialized, cleaned recursively and re-serialized, plain strings are cleaned directly; rows with replacements are
+     * updated by `meta_id`. Prints progress lines.
+     *
+     * @return void
+     */
     function cleanup_postmeta_pseudourls() {
         global $wpdb;
         //SELECT * FROM `wp_postmeta WHERE meta_value like '%data:image/svg+xml;base64%'
@@ -50,6 +65,15 @@ class ShortPixelCLI extends WP_CLI_Command {
 
     }
 
+    /**
+     * Replaces each `data:image/svg+xml;base64,...` placeholder in `$item` (string, or array/object recursively) with the
+     * URL decoded by `ShortPixelUrlTools::url_from_placeholder_svg()`.
+     *
+     * @param mixed $item Modified by reference
+     * @return int Number of replacements
+     * @todo The base64 pattern `[a-zA-Z0-9=\+]+` in `clean_item()` omits `/`, so placeholders whose base64 contains `/` are cut short and not decoded. Add `/` to the class.
+     * @todo For objects, `clean_item()` writes `$item[ $key ]`, which throws an Error ("Cannot use object as array"); use `$item->$key` for objects.
+     */
     private function clean_item(&$item) {
         $count = 0;
         if(is_array($item) || is_object($item)) {
@@ -77,6 +101,10 @@ class ShortPixelCLI extends WP_CLI_Command {
 
     /**
      * Clear the LQIPs
+     *
+     * Calls `LQIP::clearCache()` and always prints "LQIP images cleared." regardless of its result.
+     *
+     * @return void
      */
     function clear_lqips() {
         \ShortPixel\AI\LQIP::clearCache();
@@ -84,4 +112,5 @@ class ShortPixelCLI extends WP_CLI_Command {
     }
 }
 
+// Registers the `wp shortpixel` command namespace.
 WP_CLI::add_command( 'shortpixel', 'ShortPixelCLI' );

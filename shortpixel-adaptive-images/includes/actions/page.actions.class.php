@@ -10,10 +10,42 @@
 	use ShortPixel\AI\LQIP;
 	use ShortPixel\AI\Converter;
 
+	/**
+	 * AJAX handler of the admin pages (`wp_ajax_shortpixel_ai_handle_page_action`, logged-in only).
+	 *
+	 * Request: `POST action=shortpixel_ai_handle_page_action`, `spainonce`, `page`, `data[...]`. `page` is passed
+	 * through `Converter::toTitleCase()` (title-cases words and strips `.`, `-`, `_`, whitespace) and dispatched to
+	 * `handle<Page>( $data )`: `settings` -> `handleSettings`, `on-boarding` -> `handleOnBoarding`,
+	 * `front-worker`/`frontWorker` -> `handleFrontWorker` (method names are case-insensitive). The returned array
+	 * is sent with `wp_send_json()`.
+	 *
+	 * `data[action]` values handled:
+	 * - settings: `save` (`data[options]` = JSON `{ category: { option: value } }`), `save key` (`data[api_key]`),
+	 *   `remove key`, `purge_cdn_cache`, `disable advanced`, `enable advanced`, `clear css cache`, `clear lqip cache`.
+	 * - on-boarding: `run front worker`, `go to settings`, `save key` (`data[api_key]`), `use same account`; any other
+	 *   value (or `save key` without a key) advances the wizard step from `data[step]`.
+	 * - front worker: `data[option]` in `lazy-load-backgrounds`, `parse-css`, `parse-js`, `parse-json`,
+	 *   `hover-handling` with `data[value]` `'true'|'false'`; plus `data[action]=done`.
+	 *
+	 * Response shape: `{ success: bool, notice?: string (Notice::get() HTML), reload?: true, message?: string|false,
+	 * redirect?: { allowed: true, url: string }, cookie?: 'shortpixel-ai-front-worker' }`.
+	 */
 	class Actions {
 		/**
-		 * Method handles the pages's actions
-		 * Works via AJAX
+		 * Entry point of `wp_ajax_shortpixel_ai_handle_page_action`.
+		 *
+		 * Order of checks: 1) `Page::checkSpaiNonce()`: a missing or bad `spainonce` ends the request with JSON
+		 * `{ success: false, message: 'Invalid or expired nonce. ...' }`; 2) `is_admin()` and `manage_options`: on
+		 * failure the method just returns, so admin-ajax answers with a silent `0` body (no JSON); 3) a non-empty
+		 * string `page` is dispatched to `handle<Page>()`; an empty or non-string `page` sends `{ success: false }`.
+		 *
+		 * @todo `handle()` dispatches to `handle<Page>` without `method_exists()`, so an unknown `page` value makes
+		 *       `call_user_func()` throw a fatal error (HTTP 500) instead of a JSON error; it also reads
+		 *       `$_POST['page']`/`$_POST['data']` without `isset()`. Check the method against a list of known pages.
+		 * @todo A user without `manage_options` gets the silent `0` from `handle()` while a bad nonce gets JSON; answer
+		 *       both with `wp_send_json_error()` (403) so `settings.js` can show a message.
+		 *
+		 * @return void
 		 */
 		public static function handle() {
             //verify the nonce first
@@ -35,6 +67,46 @@
 			wp_send_json( $response );
 		}
 
+		/**
+		 * Settings page actions (see class docblock for the list).
+		 *
+		 * `save`: `data[options]` is `stripslashes()`ed and JSON-decoded. Sanitising, in order:
+		 * - `behaviour.api_url` is trimmed, replaced by the default CDN URL when it has no host, then
+		 *   `sanitize_text_field()`; `behaviour.storage_url` and `behaviour.host_removal` are trimmed and
+		 *   `sanitize_text_field()`ed;
+		 * - `ShortPixelAI::translateSimpleOptions()` maps the simple-mode meta options to real ones;
+		 * - when `behaviour.lqip` goes from `true` to `false` the `shortpixel_ai_lqip_state` option is deleted;
+		 * - every `{ category: { option: value } }` pair is stored as `settings.<category>.<option>`, EXCEPT values
+		 *   containing `<`, which are silently skipped (the response still says success);
+		 * - `areas.parse_css_files` is `intval()`ed and stored as `1` when > 0, else `0` if the previous value was
+		 *   `0`/unset, else `-1` (explicitly disabled). Turning it on clears the CSS cache and adds the `.htaccess`
+		 *   CORS block; turning it off removes it; an `.htaccess` failure makes the response `success: false` with
+		 *   an explanatory message, but the options are still saved;
+		 * - `behaviour.nojquery` is written only on a transition: stored `> 0` and falsy value -> `-1`; stored `<= 0`
+		 *   and truthy value -> `1`; otherwise the stored value (default `2`) is kept.
+		 * There is no whitelist of categories or option names.
+		 * The response carries a success/error notice HTML.
+		 *
+		 * `save key`: validates the key with `ShortPixelDomainTools::get_cdn_domain_usage()` (remote); when the
+		 * response has a `quota` it stores `settings.general.api_key` and asks for a reload, else an error notice with
+		 * the API error. Without `data[api_key]` it returns `{ success: false }`.
+		 * `remove key`: deletes `settings.general.api_key`, reload.
+		 * `purge_cdn_cache`: calls `ShortPixelDomainTools::purge_cdn_cache()` and sends the JSON itself (success notice
+		 * built from `Details[0].Message`, `Details.CDN.Message`, `Details.CDN.Error`, or an error notice).
+		 * `disable advanced`: `ShortPixelAI::setSimpleDefaultOptions()`, `flags.all.advanced = 0`, reload, transient
+		 * `spaiModeSwitchNotification` (60 s). `enable advanced`: `flags.all.advanced = 1`, reload, transient.
+		 * `clear css cache`: `ShortPixelAI::clear_css_cache()` + notice. `clear lqip cache`: `LQIP::clearCache()` + notice.
+		 *
+		 * @todo `handleSettings()` `save` stores any category/option name under `settings.*`, so it can also write
+		 *       keys the UI never sends (e.g. `general.api_key` without the remote validation done by `save key`).
+		 *       Whitelist the known option paths and types.
+		 * @todo `handleSettings()` `save` calls `strpos( $value, '<' )` on every value; a non-scalar value (nested
+		 *       array/object in the JSON) throws a `TypeError` on PHP 8. Skip or reject non-scalar values first.
+		 *
+		 * @param array|null $data `$_POST['data']`.
+		 *
+		 * @return array Response for `wp_send_json()`.
+		 */
 		private static function handleSettings( $data ) {
 			// action which should be handled
 			$action = isset( $data[ 'action' ] ) ? $data[ 'action' ] : null;
@@ -284,6 +356,33 @@
 			return $response;
 		}
 
+		/**
+		 * Front-worker actions sent from the front end while the on-boarding wizard's front worker runs.
+		 *
+		 * `data[option]` toggles one setting (`data[value] == 'true'`): `lazy-load-backgrounds` ->
+		 * `settings.areas.backgrounds_lazy` and `.backgrounds_lazy_style`; `parse-css` -> `settings.areas.parse_css_files`
+		 * (stored as bool, not `-1/0/1`; clears the CSS cache when enabled; no `.htaccess` update); `parse-js` ->
+		 * `settings.areas.parse_js`; `parse-json` -> `settings.areas.parse_json`; `hover-handling` ->
+		 * `settings.behaviour.hover_handling`.
+		 *
+		 * `data[action]=done`: tries to remove the current user's entry from `pages.on_boarding.front_worker`,
+		 * switches to advanced mode when `ShortPixelAI::verifySimpleOptions()` says the simple UI cannot show the
+		 * resulting settings, saves the front-worker Option and returns the cookie name and a redirect to the wizard.
+		 *
+		 * @todo In `handleFrontWorker()` `done`, `$opts->get( 1, 'advanced', ['flags', 'all'] )` has its arguments in
+		 *       the wrong order (name `1`, category `advanced`, default `['flags','all']`), so it always returns the
+		 *       array default and the "already advanced" check never applies. Use `get( 'advanced', [ 'flags', 'all' ], 0 )`.
+		 * @todo `handleFrontWorker()` `done` removes the entry keyed by `user_login`, but `handleOnBoarding()`
+		 *       `run front worker` stores it keyed by user `ID`, so the entry is never removed. In addition `Option` has
+		 *       no `__isset()`/`__unset()`, so `!empty( $front_worker->{$key} )` is always false and `unset()` would
+		 *       not reach the `__dyna` bag. Key both by ID and remove with `Option::unsetProperty()`.
+		 * @todo `handleFrontWorker()` `parse-css` stores a bool and skips the `.htaccess` CORS block that the
+		 *       settings `save` path adds; use the same `-1/0/1` coercion and `AccessControlHeaders` call.
+		 *
+		 * @param array|null $data `$_POST['data']`.
+		 *
+		 * @return array Response for `wp_send_json()`.
+		 */
 		private static function handleFrontWorker( $data ) {
 			// action which should be handled
 			$action = isset( $data[ 'action' ] ) ? $data[ 'action' ] : null;
@@ -353,6 +452,24 @@
 			return $response;
 		}
 
+		/**
+		 * On-boarding wizard actions.
+		 *
+		 * The step count comes from `Page\Constants::_()->onBoarding['messages']`.
+		 * - `run front worker`: for the current user ID stores `pages.on_boarding.front_worker.<ID> = { enabled: true,
+		 *   token: ShortPixelAI::get_user_token() }` and returns a redirect to `home_url()` plus the cookie name
+		 *   `shortpixel-ai-front-worker`; an error notice when the user ID is empty.
+		 * - `go to settings`: sets `step` to the last step and `has_been_passed` to true; redirect to the settings page.
+		 * - `save key`: validates `data[api_key]` remotely (`get_cdn_domain_usage`, needs `quota`), stores it, success
+		 *   or error notice, reload on success.
+		 * - `use same account`: `ShortPixelDomainTools::use_shortpixel_account()` (reuses the SPIO key), notice, reload.
+		 * - anything else: `step = min( (int) data[step] + 1, last )`; past the last step sets `has_been_passed` and
+		 *   redirects to the settings page, otherwise returns the next step's message HTML in `message`.
+		 *
+		 * @param array|null $data `$_POST['data']`.
+		 *
+		 * @return array Response for `wp_send_json()`.
+		 */
 		private static function handleOnBoarding( $data ) {
 			// action which should be handled
 			$action = isset( $data[ 'action' ] ) ? $data[ 'action' ] : null;

@@ -6,33 +6,129 @@
 	use ShortPixel\AI\Page;
 	use ShortPixelAI;
 
+	/**
+	 * Texts and buttons of the local admin notices, one public array property per notice.
+	 *
+	 * Each property has the shape `[ 'causer' => string (optional, informational), 'title' => string,
+	 * 'body' => string[] (HTML), 'buttons' => array[] (see `Notice::renderButtons()`) ]` and is passed as
+	 * `$data['message']` to `Notice::render()`. `Notice::renderNotices()` passes the causer explicitly; the
+	 * dismissed-notices panel of `settings.tpl.php` reads these properties by dismissal key and uses `causer`
+	 * (or the key) as `data-causer`. Button `action` values are the `data[action]` handled by `Notice\Actions`.
+	 *
+	 * Built once (singleton) by `ShortPixelAI` in the back end and by `Page`.
+	 *
+	 * @todo The constructor's `mbstring` `__()` call has no text domain; add `'shortpixel-adaptive-images'`.
+	 * @todo The constructor reads `$_SERVER['HTTP_HOST']`/`REQUEST_URI` for the `missing_jquery` and
+	 *       `temporary_redirect` `return_url`, which raises warnings when built outside a web request (WP-CLI, cron).
+	 *       Guard with `isset()`.
+	 * @todo The constructor's comment "if causer not specified, the name of constant will be used as causer" is
+	 *       true only for the settings-page dismissed panel; `renderNotices()` hardcodes the causers.
+	 */
 	class Constants {
+		/**
+		 * @var \ShortPixel\AI\Notice\Constants|null The singleton, set by the first constructor call.
+		 */
 		private static $instance;
 
+		/**
+		 * @var array $autoptimize Autoptimize "Optimize images on the fly" conflict; causer `ao`; button `solve conflict`.
+		 */
 		public $autoptimize;
+		/**
+		 * @var array $avadalazy Avada theme lazy-loading conflict; link to the Avada options only.
+		 */
 		public $avadalazy;
+        /**
+         * @var array $ginger Ginger - EU Cookie Law opt-in conflict; links only.
+         */
         public $ginger;
+        /**
+         * @var array $speedoptimizer Speed Optimizer "Combine JavaScript Files" conflict; link only.
+         */
         public $speedoptimizer;
+		/**
+		 * @var array $divitoolbox Divi Toolbox "Custom Post Meta" conflict; links only.
+		 */
 		public $divitoolbox;
+        /**
+         * @var array $mbstring Missing PHP mbstring extension; no buttons.
+         */
         public $mbstring;
+		/**
+		 * @var array $elementorexternal Never assigned (the Elementor external-CSS message is commented out as obsolete).
+		 */
 		public $elementorexternal;
+		/**
+		 * @var array $beta Beta-phase notice with a contact link.
+		 */
 		public $beta;
+		/**
+		 * @var array $on_boarding "Open Wizard" notice (causer `on boarding`, buttons `redirect` and `dismiss`); currently never rendered.
+		 */
 		public $on_boarding;
+		/**
+		 * @var array $lazy Another lazy loader detected; button `dismiss forever`.
+		 */
 		public $lazy;
+		/**
+		 * @var array $wp_rocket_defer_js WP Rocket deferred JS without safe mode (causer `wp rocket defer js`); button `solve conflict`.
+		 */
 		public $wp_rocket_defer_js;
+		/**
+		 * @var array $wp_rocket_lazy WP Rocket lazy-load conflict (causer `wp rocket lazy`); link to WP Rocket media settings.
+		 */
 		public $wp_rocket_lazy;
+		/**
+		 * @var array $wprocketcss WP Rocket "Minify CSS" vs SPAI CSS parsing; link to WP Rocket file optimisation settings.
+		 */
 		public $wprocketcss;
+		/**
+		 * @var array $key "You already have a ShortPixel account" (body[0] has a `%s` for the account e-mail); button `use account`.
+		 */
 		public $key;
+        /**
+         * @var array $remote_get_error Network error contacting ShortPixel (body[0] has a `%s` for the error text); no buttons.
+         */
         public $remote_get_error;
+		/**
+		 * @var array $credits Static quota-exceeded text; the rendered credits notice uses `Notice::getCreditsNoticeInfo()` instead.
+		 */
 		public $credits;
+		/**
+		 * @var array $twicelossy SPAI and SPIO both lossy; links to both settings pages.
+		 */
 		public $twicelossy;
+		/**
+		 * @var array $missing_jquery jQuery missing on the front end (causer `missing jquery`); button `re-check` with `additional.return_url` = current URL.
+		 */
 		public $missing_jquery;
+        /**
+         * @var array $temporary_redirect Images not reachable by the CDN (causer `temporary redirect`); button `re-check` with `additional.return_url`.
+         */
         public $temporary_redirect;
+		/**
+		 * @var array $swift_performance Swift Performance merge-styles/normalize conflict (causer `swift performance`); title includes the edition; button `solve conflict`.
+		 */
 		public $swift_performance;
+		/**
+		 * @var array $imagify Imagify WebP delivery conflict; button `solve conflict`.
+		 */
 		public $imagify;
+		/**
+		 * @var array $spio_webp SPIO "Deliver next generation images" conflict (causer `spio webp`); button `solve conflict`.
+		 */
 		public $spio_webp;
+		/**
+		 * @var array $litespeed_js_combine LiteSpeed Cache JS Combine conflict (causer `litespeed js combine`); button `solve conflict`.
+		 */
 		public $litespeed_js_combine;
+		/**
+		 * @var array $wpo_merge_css WP-Optimize CSS merging conflict (causer `wpo merge css`); buttons `add exclusions`, `solve conflict`.
+		 */
 		public $wpo_merge_css;
+		/**
+		 * @var array $lqip_mkdir_failed LQIP folder could not be created (causer `lqip mkdir failed`); no buttons.
+		 */
 		public $lqip_mkdir_failed;
 
 		/**
@@ -47,7 +143,8 @@
 		}
 
 		/**
-		 * Constants constructor.
+		 * Fills every notice property (translated strings, admin URLs, affiliate-filtered links). Reads the Swift
+		 * Performance integration info from `ActiveIntegrations` for its title. The controller is not used.
 		 *
 		 * @param \ShortPixelAI|null $controller
 		 */

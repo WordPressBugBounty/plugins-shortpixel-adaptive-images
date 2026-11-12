@@ -1,5 +1,53 @@
 <?php
 	/**
+	 * Settings page template (`options-general.php?page=shortpixel-ai-settings`).
+	 *
+	 * Included by `ShortPixel\AI\Page::render( 'settings.tpl.php' )` inside `<div class="wrap">`, so `$this` is the
+	 * `ShortPixel\AI\Page` instance (`$this->ctrl`, `$this->noticeConstants`, `$this->getNonce()`).
+	 * Assets: `spai-settings` (`assets/js/pages/settings.js`) with `exclusionsL10n` / `statusBox`, enqueued by
+	 * `Page::enqueueAdminScripts()`.
+	 *
+	 * Variables defined here: `$controller` (`$this->ctrl`), `$options` (`ShortPixel\AI\Options`), `$integrations`
+	 * (`ActiveIntegrations::_( true )`), `$status_box_integrations` (active integration names), `$spai_key`,
+	 * `$domain_usage`, `$domain_status`, `$domain`, `$cdn_domain` (host of `settings.behaviour.api_url`), `$is_our_cdn`,
+	 * `$submit_button_attributes`, `$css_status` (`enough|few|insufficiently`), `$status_text`, `$tooltip_text`, and
+	 * further down `$login_link`, `$api_key`, `$dismissed`, `$message` and per-field locals.
+	 *
+	 * Remote calls made while rendering (on top of those in `Page::enqueueAdminScripts()` and `Notice`):
+	 * `ShortPixelDomainTools::get_cdn_domain_usage( null, $spai_key, true )` (refreshed, only with a key),
+	 * `get_domain_status( true )` (refreshed), and `get_shortpixel_account()` when the `key` notice is in the
+	 * dismissed list. The "ShortPixel News" box (`#spaiNewsFeed`) is filled client-side from the blog RSS.
+	 *
+	 * Markup hooks used by `settings.js` and `notice.js`:
+	 * - Forms: `#api-key-form` (AJAX `shortpixel_ai_handle_page_action`, `page=settings`, `data[action]=save key`,
+	 *   `data[api_key]`), `#import_settings_form` (POST to `admin.php?page=shortpixel-ai-import-settings`, file
+	 *   `import_settings_file`, hidden `#import_spainonce`), `#settings-form` (serialised into `data[options]` JSON by
+	 *   `settings.js`, `data[action]=save`). Each carries a hidden `spainonce` (`$this->getNonce()`).
+	 * - Tabs: `#wpspai-tabs` with `#compression-tab`, `#behaviour-tab`, `#areas-tab`, `#exclusions-tab`
+	 *   (`href="#top#<tab>"`) switching `.spai_settings_tab` panes `#compression`, `#behaviour`, `#areas`,
+	 *   `#exclusions` in advanced mode (`flags.all.advanced`), or the single `#simple` pane otherwise.
+	 *   `#spai_settings_advanced` toggles the mode (`enable advanced` / `disable advanced`).
+	 * - Inputs: `name` = option name, `data-type` (`bool|int|string`) tells `settings.js` how to coerce the value;
+	 *   `data-depender`/`data-depended`/`data-parent` drive dependent fields; `data-exclusion-type`, `data-setting`,
+	 *   `data-separator`, `data-limit` drive the exclusion lists; `data-explanation`, `data-link`, `data-tippy-*` are
+	 *   help texts/tooltips.
+	 * - `[data-action]` buttons: `remove key`, `purge_cdn_cache` (`#purge_cdn_cache`), `clear lqip cache`; plus
+	 *   `#clear_css_cache`, `#export_settings` / `.export-settings` (redirect to the export page with `spainonce` and
+	 *   `noheader=true`), `#import_settings` (label of the file input), `[data-pressed-text]`, `[data-saving-text]`.
+	 * - Dismissed-notices panel: `.dismissed-notice-wrap[data-key]` > `.dismissed-notice[data-causer]
+	 *   [data-plugin="short-pixel-ai"]` with `Notice::renderButtons()` buttons, handled by `notice.js`.
+	 * - Inline `jQuery.spaiHelpInit()` call.
+	 * - The campaign banner (`.shortpixel-bf`, `ShortPixelAI::renderPromoBanner()`) under the header links, when one shows.
+	 *
+	 * @todo The dismissed-notices panel renders `.dismissed-notice` without `data-spainonce`, so `notice.js` posts an
+	 *       empty `spainonce` and every button there fails `Page::checkSpaiNonce()`. Add
+	 *       a `data-spainonce` attribute printing `$this->getNonce()` to the element.
+	 * @todo The dismissed-notices panel reads `$this->noticeConstants->{$key}` for every dismissal key; keys that are
+	 *       not properties (`remote_info_notice___<id>`, `wp_rocket_css`, `recommend_survey`, …) produce warnings and an
+	 *       empty entry. Skip keys without a constant.
+	 * @todo The top-up link reads `$_SERVER['HTTPS']` without `isset()` (warning on plain HTTP); use `is_ssl()`.
+	 * @todo `$domain_status->…` is read without checking the remote call returned an object.
+	 *
 	 * @var \ShortPixelAI $controller
 	 */
 
@@ -90,6 +138,7 @@ $controller = $this->ctrl;
 				<a href="https://shortpixel.com/knowledge-base/category/307-shortpixel-adaptive-images" target="_blank"><?= __( 'Knowledge Base', 'shortpixel-adaptive-images' ); ?></a> |&nbsp;
 				<a href="<?= apply_filters('spai_affiliate_link',ShortPixelAI::DEFAULT_MAIN_DOMAIN. '/contact') ?>" target="_blank"><?= __( 'Support', 'shortpixel-adaptive-images' ); ?></a>
 			</div>
+			<?php $controller->renderPromoBanner(); ?>
 			<div class="spai_statusbox_wrap">
 				<div class="title_wrap" data-status="<?= $css_status; ?>">
 					<strong>

@@ -1,19 +1,46 @@
 <?php
 /**
- * User: simon
- * Date: 20.11.2020
+ * CacheCleaner: page-cache purge and per-page cache exclusion for third-party cache plugins.
  */
 
 namespace ShortPixel\AI;
 
+/**
+ * Singleton that purges third-party page caches and asks them not to cache the current page.
+ *
+ * clear() is called after selector-list changes in the settings AJAX handlers (whole
+ * cache) and by `LQIP` after generating placeholders (only the pages that used them,
+ * without wp_cache_flush()). excludeCurrentPage() is called from
+ * `ShortPixelAI::maybe_replace_images_src()` when the page still has blank LQIP
+ * placeholders.
+ *
+ * Static state a test must reset: `CacheCleaner::$instance` (set back to false); the
+ * cached `$LOGGER_ON` value depends on `SHORTPIXEL_AI_DEBUG` at construction.
+ * excludeCurrentPage() also defines the constants `DONOTCACHEPAGE` and `LSCACHE_NO_CACHE`,
+ * which cannot be undone, so tests of it belong in an isolated process.
+ */
 class CacheCleaner
 {
+    /**
+     * The singleton, or false before the first call to _().
+     *
+     * @var CacheCleaner|false
+     */
     private static $instance = false;
+    /**
+     * @var \ShortPixelAILogger
+     */
     private $logger;
+    /**
+     * Non-zero when `SHORTPIXEL_AI_DEBUG` has the `DEBUG_AREA_CACHE` bit (8).
+     *
+     * @var int
+     */
     private $LOGGER_ON;
 
     /**
-     * @param bool $refresh
+     * Returns the singleton.
+     *
      * @return CacheCleaner
      */
     public static function _()
@@ -24,12 +51,62 @@ class CacheCleaner
         return self::$instance;
     }
 
+    /**
+     * Grabs the logger and caches whether cache-area logging is on.
+     */
     protected function __construct()
     {
         $this->logger = \ShortPixelAILogger::instance();
         $this->LOGGER_ON = (SHORTPIXEL_AI_DEBUG & \ShortPixelAILogger::DEBUG_AREA_CACHE);
     }
 
+    /**
+     * Purges the page caches of every detected cache plugin and appends a hint to the message.
+     *
+     * With `$wpFlush` it first calls wp_cache_flush(). A single URL string is wrapped in an
+     * array. Then, for each plugin present (detected by class or function, not by
+     * `ActiveIntegrations`), with URLs / without URLs:
+     * - Comet Cache (class `comet_cache`): `comet_cache::clearUrl( $url )` / `comet_cache::clear()`,
+     *   inside a try/catch.
+     * - WP Rocket (function `rocket_clean_domain`): `rocket_clean_files( $urls )` / `rocket_clean_domain()`.
+     * - W3 Total Cache (function `w3tc_flush_all`): `w3tc_flush_url( $url )` / `w3tc_flush_all()`.
+     * - Swift Performance (class `Swift_Performance_Cache`): `clear_permalink_cache( $url )` / `clear_all_cache()`.
+     * - Cache Enabler (class `Cache_Enabler`): `clear_page_cache_by_url( $url )` / `clear_complete_cache()`.
+     * - WP-Optimize (class `WPO_Page_Cache`): `WPO_Page_Cache::delete_cache_by_url( $url )` /
+     *   `WP_Optimize()->get_page_cache()->purge()`.
+     * - LiteSpeed (class `LiteSpeed\Purge`): `( new Purge() )->purge_url( $url )` / `Purge::purge_all()`.
+     * - WP Super Cache (function `wpsc_delete_url_cache`): `wpsc_delete_url_cache( $url )` /
+     *   `wp_cache_clear_cache()`. Does not mark the cache as cleared.
+     * - Breeze (class `Breeze_PurgeCache`): `purge_post_on_update( url_to_postid( $url ) )` for
+     *   URLs that map to a post / `breeze_cache_flush()`.
+     * - WP Fastest Cache: no purge call.
+     * Each of the first seven marks the cache as cleared.
+     *
+     * Filesystem fallback, only when nothing was marked cleared and URLs were given: for each
+     * directory under `WP_CONTENT_DIR/cache/` and each URL whose host is the site host
+     * (isAllowedCacheClearUrl()) and whose path has no `..`, deletes the `.html`/`.htm` files in
+     * `<cache dir>/<url path>` (deleteHtmlFiles()), stopping at the first deletion.
+     *
+     * @param string               $message Message to return, typically the AJAX result message.
+     * @param string|string[]|false $urls   URLs to purge, or false to purge everything.
+     * @param bool                 $wpFlush True to call wp_cache_flush() first.
+     *
+     * @return string `$message` followed by " Please press OK to refresh the page." when a
+     *                cache was cleared, otherwise by a newline and a request to clear all
+     *                page cache levels manually.
+     *
+     * @todo clear() catches `Throwable` and `Exception` unqualified inside the `ShortPixel\AI`
+     *       namespace, so they resolve to `ShortPixel\AI\Throwable` / `ShortPixel\AI\Exception`
+     *       and nothing thrown by Comet Cache is caught. Use `\Throwable`. The second
+     *       `catch(Exception)` is a PHP 5.6 fallback for runtimes without `Throwable`; it is
+     *       dead now that the plugin floor is PHP 7.4 and can be removed.
+     * @todo clear() passes `$cache_cleared` to the Breeze closure by value (`use($cache_cleared)`),
+     *       so purging Breeze by URL never marks the cache as cleared and the filesystem fallback
+     *       still runs. Use `use(&$cache_cleared)` or a foreach loop.
+     * @todo clear() never marks the cache as cleared after the WP Super Cache purge, so the
+     *       returned message asks for a manual purge and the filesystem fallback still runs.
+     *       Set `$cache_cleared = true` in that branch.
+     */
     public function clear($message, $urls = false, $wpFlush = true) {
         $result = $message;
         $cache_cleared = false;
@@ -284,6 +361,31 @@ class CacheCleaner
         return $host && $site_host && strcasecmp($host, $site_host) === 0;
     }
 
+    /**
+     * Asks every supported cache plugin not to cache the page being rendered.
+     *
+     * Current URL: `home_url( add_query_arg( array(), $wp->request ) )`. Calls made:
+     * - WP Rocket: filter `rocket_cache_reject_uri` returning `[ $currentUrl ]`.
+     * - W3 Total Cache, WP-Optimize, WP Super Cache: defines `DONOTCACHEPAGE` (if not defined).
+     * - Swift Performance: filter `swift_performance_is_cacheable` returning false.
+     * - Cache Enabler: filter `bypass_cache` returning false.
+     * - LiteSpeed: defines `LSCACHE_NO_CACHE` true.
+     * - WP Fastest Cache: `wpfc_exclude_current_page()` when the function exists.
+     *
+     * @return void
+     *
+     * @todo excludeCurrentPage() returns false from the Cache Enabler `bypass_cache` filter,
+     *       which means "do not bypass", so Cache Enabler still caches the page. Return true
+     *       (and also hook `cache_enabler_bypass_cache`, the filter name current Cache Enabler
+     *       versions use).
+     * @todo excludeCurrentPage() defines `LSCACHE_NO_CACHE` without a `defined()` guard, so a
+     *       second call in the same request, or LiteSpeed having defined it, raises a
+     *       "Constant already defined" warning. Guard it like `DONOTCACHEPAGE`.
+     * @todo excludeCurrentPage() replaces the whole `rocket_cache_reject_uri` list with an
+     *       absolute URL, discarding the rules WP Rocket and other plugins put there, while WP
+     *       Rocket expects URI path patterns. Accept the existing array and append the path of
+     *       the current URL.
+     */
     public function excludeCurrentPage()
     {
         global $wp;
